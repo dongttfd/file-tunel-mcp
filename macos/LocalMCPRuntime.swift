@@ -1,4 +1,5 @@
 import Foundation
+import Dispatch
 import Darwin
 import Security
 
@@ -18,6 +19,8 @@ enum LocalMCPRuntimeState: Equatable {
     case stopped
     case starting
     case running
+    case restarting(String)
+    case cooldown(String)
     case stopping
     case failed(String)
 }
@@ -87,6 +90,13 @@ private final class ProfileLock {
 }
 
 final class LocalMCPRuntime {
+    private struct TunnelLaunchContext {
+        let executable: String
+        let arguments: [String]
+        let environment: [String: String]
+        let sensitiveValues: [String]
+    }
+
     private let queue = DispatchQueue(label: "com.filemcp.runtime", qos: .userInitiated)
     private let queueSpecificKey = DispatchSpecificKey<Void>()
     private let stateLock = NSLock()
@@ -97,12 +107,28 @@ final class LocalMCPRuntime {
     private var profileLock: ProfileLock?
     private var requestedStop = false
     private let profileDirectoryOverride: URL?
+    private let restartPolicy: TunnelRestartPolicy
+    private let nowProvider: () -> Date
+    private let jitterProvider: () -> Double
+    private var restartWorkItem: DispatchWorkItem?
+    private var tunnelLaunch: TunnelLaunchContext?
+    private var tunnelStartedAt: Date?
+    private var tunnelGeneration = 0
+    private var restartScheduleGeneration = 0
 
     var onStateChange: ((LocalMCPRuntimeState) -> Void)?
     var onLog: ((String) -> Void)?
 
-    init(profileDirectory: URL? = nil) {
+    init(
+        profileDirectory: URL? = nil,
+        supervisorOptions: TunnelSupervisorOptions = .default,
+        nowProvider: @escaping () -> Date = Date.init,
+        jitterProvider: @escaping () -> Double = { Double.random(in: 0...1) }
+    ) {
         profileDirectoryOverride = profileDirectory
+        restartPolicy = TunnelRestartPolicy(options: supervisorOptions)
+        self.nowProvider = nowProvider
+        self.jitterProvider = jitterProvider
         queue.setSpecific(key: queueSpecificKey, value: ())
     }
 
@@ -132,6 +158,7 @@ final class LocalMCPRuntime {
                 break
             }
             self.setState(.stopping)
+            self.cancelPendingRestart()
             self.tunnelProcess?.stop()
             if self.tunnelProcess == nil {
                 self.finishStop()
@@ -149,16 +176,19 @@ final class LocalMCPRuntime {
     }
 
     private func shutdownOnQueue() {
+        cancelPendingRestart()
+        tunnelGeneration &+= 1
         tunnelProcess?.stopSynchronously()
+        tunnelProcess = nil
         server?.stop()
         server = nil
         profileLock?.release()
         profileLock = nil
-
-        if tunnelProcess == nil {
-            setStopRequested(false)
-            setState(.stopped)
-        }
+        tunnelLaunch = nil
+        tunnelStartedAt = nil
+        restartPolicy.reset()
+        setStopRequested(false)
+        setState(.stopped)
     }
 
     private func startOnQueue(_ configuration: LocalMCPConfiguration) {
@@ -245,7 +275,7 @@ final class LocalMCPRuntime {
             }
             try requireSuccess(doctorResult, operation: "tunnel-client doctor", sensitiveValues: sensitiveValues)
 
-            let managed = try ProcessRunner.startManaged(
+            let launch = TunnelLaunchContext(
                 executable: tunnelClient,
                 arguments: [
                     "run",
@@ -254,17 +284,11 @@ final class LocalMCPRuntime {
                     "--health-listen-addr", healthAddress,
                 ],
                 environment: environment,
-                onOutput: { [weak self] text in
-                    guard let self else { return }
-                    self.emitLog(self.redactSensitiveValues(text, sensitiveValues: sensitiveValues))
-                },
-                onExit: { [weak self] exitCode in
-                    self?.queue.async {
-                        self?.tunnelDidExit(exitCode: exitCode)
-                    }
-                }
+                sensitiveValues: sensitiveValues
             )
-            tunnelProcess = managed
+            tunnelLaunch = launch
+            restartPolicy.reset()
+            try startTunnelProcess(launch)
             setState(.running)
             emitLog("OpenAI Secure MCP Tunnel started. Command execution: \(configuration.enableCommands ? "enabled" : "disabled").\n")
         } catch {
@@ -272,43 +296,133 @@ final class LocalMCPRuntime {
                 finishStop()
                 return
             }
+            cancelPendingRestart()
+            tunnelGeneration &+= 1
             server?.stop()
             server = nil
             tunnelProcess = nil
             profileLock?.release()
             profileLock = nil
+            tunnelLaunch = nil
+            tunnelStartedAt = nil
+            restartPolicy.reset()
             setState(.failed(error.localizedDescription))
             emitLog("ERROR: \(error.localizedDescription)\n")
         }
     }
 
-    private func tunnelDidExit(exitCode: Int32) {
+    private func startTunnelProcess(_ launch: TunnelLaunchContext) throws {
+        tunnelGeneration &+= 1
+        let generation = tunnelGeneration
+        let managed = try ProcessRunner.startManaged(
+            executable: launch.executable,
+            arguments: launch.arguments,
+            environment: launch.environment,
+            onOutput: { [weak self] text in
+                guard let self else { return }
+                self.emitLog(self.redactSensitiveValues(text, sensitiveValues: launch.sensitiveValues))
+            },
+            onExit: { [weak self] exitCode in
+                self?.queue.async {
+                    self?.tunnelDidExit(generation: generation, exitCode: exitCode)
+                }
+            }
+        )
+        tunnelProcess = managed
+        tunnelStartedAt = nowProvider()
+    }
+
+    private func tunnelDidExit(generation: Int, exitCode: Int32) {
+        guard generation == tunnelGeneration else { return }
         tunnelProcess = nil
-        server?.stop()
-        server = nil
-        profileLock?.release()
-        profileLock = nil
 
         if isStopRequested {
-            setStopRequested(false)
-            setState(.stopped)
-            emitLog("Tunnel stopped.\n")
-        } else if exitCode == 0 {
-            setState(.stopped)
-            emitLog("Tunnel stopped.\n")
-        } else {
-            let message = "Tunnel stopped unexpectedly (exit status \(exitCode))."
+            finishStop()
+            return
+        }
+
+        guard tunnelLaunch != nil else {
+            let message = "Tunnel stopped and restart context is unavailable."
             setState(.failed(message))
             emitLog(message + "\n")
+            return
         }
+
+        let now = nowProvider()
+        let started = tunnelStartedAt ?? now
+        let decision = restartPolicy.next(
+            processStarted: started,
+            now: now,
+            random: jitterProvider
+        )
+        scheduleRestart(decision, exitCode: exitCode)
+    }
+
+    private func scheduleRestart(_ decision: TunnelRestartDecision, exitCode: Int32) {
+        cancelPendingRestart()
+
+        if decision.isCooldown {
+            setState(.cooldown("Tunnel exited with status \(exitCode); restart budget exhausted."))
+            emitLog("Tunnel exited unexpectedly (status \(exitCode)). Restart budget exhausted; cooldown \(Int(decision.delay * 1_000)) ms.\n")
+        } else {
+            setState(.restarting("Tunnel exited with status \(exitCode); restart attempt \(decision.attemptNumber) pending."))
+            emitLog("Tunnel exited unexpectedly (status \(exitCode)). Restart attempt \(decision.attemptNumber) in \(Int(decision.delay * 1_000)) ms.\n")
+        }
+
+        let scheduleGeneration = restartScheduleGeneration
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, scheduleGeneration == self.restartScheduleGeneration else { return }
+            self.restartWorkItem = nil
+            guard !self.isStopRequested, let launch = self.tunnelLaunch else { return }
+
+            if decision.isCooldown {
+                self.restartPolicy.reset()
+                let now = self.nowProvider()
+                let next = self.restartPolicy.next(
+                    processStarted: now,
+                    now: now,
+                    random: self.jitterProvider
+                )
+                self.scheduleRestart(next, exitCode: exitCode)
+                return
+            }
+
+            do {
+                try self.startTunnelProcess(launch)
+                self.setState(.running)
+                self.emitLog("Tunnel restart succeeded.\n")
+            } catch {
+                let now = self.nowProvider()
+                self.emitLog("Tunnel restart launch failed: \(error.localizedDescription)\n")
+                let next = self.restartPolicy.next(
+                    processStarted: now,
+                    now: now,
+                    random: self.jitterProvider
+                )
+                self.scheduleRestart(next, exitCode: exitCode)
+            }
+        }
+        restartWorkItem = item
+        queue.asyncAfter(deadline: .now() + decision.delay, execute: item)
+    }
+
+    private func cancelPendingRestart() {
+        restartScheduleGeneration &+= 1
+        restartWorkItem?.cancel()
+        restartWorkItem = nil
     }
 
     private func finishStop() {
+        cancelPendingRestart()
+        tunnelGeneration &+= 1
         server?.stop()
         server = nil
         tunnelProcess = nil
         profileLock?.release()
         profileLock = nil
+        tunnelLaunch = nil
+        tunnelStartedAt = nil
+        restartPolicy.reset()
         setStopRequested(false)
         setState(.stopped)
         emitLog("Tunnel stopped.\n")

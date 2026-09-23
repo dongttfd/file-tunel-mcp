@@ -48,6 +48,8 @@ public enum LocalMcpRuntimeStatus
     Stopped,
     Starting,
     Running,
+    Restarting,
+    Cooldown,
     Stopping,
     Failed,
 }
@@ -57,6 +59,8 @@ public sealed record LocalMcpRuntimeState(LocalMcpRuntimeStatus Status, string? 
     public static LocalMcpRuntimeState Stopped { get; } = new(LocalMcpRuntimeStatus.Stopped);
     public static LocalMcpRuntimeState Starting { get; } = new(LocalMcpRuntimeStatus.Starting);
     public static LocalMcpRuntimeState Running { get; } = new(LocalMcpRuntimeStatus.Running);
+    public static LocalMcpRuntimeState Restarting(string message) => new(LocalMcpRuntimeStatus.Restarting, message);
+    public static LocalMcpRuntimeState Cooldown(string message) => new(LocalMcpRuntimeStatus.Cooldown, message);
     public static LocalMcpRuntimeState Stopping { get; } = new(LocalMcpRuntimeStatus.Stopping);
     public static LocalMcpRuntimeState Failed(string message) => new(LocalMcpRuntimeStatus.Failed, message);
 }
@@ -65,15 +69,34 @@ public sealed class FileMcpException(string message) : Exception(message);
 
 internal sealed record ToolCallOutput(JsonArray Content, JsonObject StructuredContent);
 
+public sealed class FileMcpWorkspaceSettings
+{
+    public string Key { get; set; } = "";
+    public bool Enabled { get; set; }
+    public string TunnelId { get; set; } = "";
+    public string Profile { get; set; } = "";
+    public int Port { get; set; }
+    public string AllowedDirectory { get; set; } = "";
+    public string HealthAddress { get; set; } = "127.0.0.1:0";
+}
+
 public sealed class FileMcpSettings
 {
+    // Legacy single-workspace fields are retained for backward compatibility with
+    // existing settings.json files and older callers. SettingsStore keeps them
+    // synchronized with the first enabled workspace.
     public string TunnelId { get; set; } = "";
     public string Profile { get; set; } = "filemcp";
     public int Port { get; set; } = 8008;
     public string AllowedDirectory { get; set; } = Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "FileMCP");
     public string HealthAddress { get; set; } = "127.0.0.1:0";
+
+    public List<FileMcpWorkspaceSettings> Workspaces { get; set; } = [];
+
     public string GitUserName { get; set; } = "";
     public string GitUserEmail { get; set; } = "";
     public bool EnableCommands { get; set; }
+    public bool OtlpEnabled { get; set; }
+    public string OtlpEndpoint { get; set; } = OtlpTelemetrySettings.DefaultEndpoint;
 }

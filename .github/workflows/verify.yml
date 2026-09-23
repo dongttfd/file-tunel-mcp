@@ -23,7 +23,7 @@ jobs:
           set -Eeuo pipefail
           test "$(cat vendor/tunnel-client/VERSION)" = "0.0.12"
           test "$(shasum -a 256 vendor/tunnel-client/darwin-arm64/tunnel-client | awk '{print $1}')" = "b1757220cf4722cec9085ee4a908cf0ee4c1a499a33bd99979b9a9c7669e29b1"
-          vendor/tunnel-client/darwin-arm64/tunnel-client --version | grep -q '^0.0.12+881c9a8fed7cccbe6607cd419863bbca506b8215 '
+          vendor/tunnel-client/darwin-arm64/tunnel-client --version | grep -Fq '0.0.12+881c9a8fed7cccbe6607cd419863bbca506b8215 '
           test -s vendor/tunnel-client/NOTICE
           test -s vendor/tunnel-client/darwin-arm64/THIRD-PARTY-LICENSES.txt
 
@@ -31,14 +31,16 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          bash -n build_macos_app.sh build_macos_icon.sh create_source_archive.sh run_macos_dev.sh tests/test_swift_runtime.sh
+          bash -n build_macos_app.sh build_macos_icon.sh create_source_archive.sh run_macos_dev.sh tests/test_swift_runtime.sh release/sign_notarize_macos.sh
           plutil -lint macos/Info.plist
           swiftc -warnings-as-errors -typecheck \
             -framework AppKit \
             -framework Network \
             -framework Security \
             macos/ProcessRunner.swift \
+            macos/LogicalChatCorrelation.swift \
             macos/LocalMCPServer.swift \
+            macos/TunnelSupervisor.swift \
             macos/LocalMCPRuntime.swift \
             macos/FileMCPApp.swift \
             macos/main.swift
@@ -63,6 +65,7 @@ jobs:
     timeout-minutes: 20
     env:
       MCP_HTTP_FUZZ_ITERATIONS: "40"
+      FILEMCP_WINDOWS_STAGING_NAME: FileMCP-release
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -89,17 +92,53 @@ jobs:
         shell: pwsh
         run: dotnet build windows/FileMCP.Windows.sln -c Release -warnaserror
 
+      - name: Verify Windows release contract
+        shell: pwsh
+        run: ./tests/test_windows_release_contract.ps1
+
+      - name: Verify cross-platform tool surface
+        shell: pwsh
+        run: ./tests/test_tool_surface_parity.ps1
+
+      - name: Verify macOS supervisor contract
+        shell: pwsh
+        run: ./tests/test_macos_supervisor_contract.ps1
+
+      - name: Verify HTTP connection bounds contract
+        shell: pwsh
+        run: ./tests/test_http_connection_bounds_contract.ps1
+
+      - name: Verify dynamic health discovery contract
+        shell: pwsh
+        run: ./tests/test_dynamic_health_discovery_contract.ps1
+
+      - name: Verify Windows ARM64 assurance contract
+        shell: pwsh
+        run: ./tests/test_windows_arm64_assurance_contract.ps1
+
+      - name: Verify Windows single-instance contract
+        shell: pwsh
+        run: ./tests/test_windows_single_instance_contract.ps1
+
+      - name: Verify production release signing contract
+        shell: pwsh
+        run: ./tests/test_release_signing_contract.ps1
+
+      - name: Verify release secret provisioning contract
+        shell: pwsh
+        run: ./tests/test_release_secret_provisioning_contract.ps1
+
       - name: Windows integration tests
         shell: pwsh
         run: ./tests/test_windows_runtime.ps1
 
       - name: Build Windows x64 release
         shell: pwsh
-        run: ./build_windows_app.ps1 -Architecture x64
+        run: ./build_windows_app.ps1 -Architecture x64 -StagingName $env:FILEMCP_WINDOWS_STAGING_NAME
 
       - name: Build Windows arm64 release
         shell: pwsh
-        run: ./build_windows_app.ps1 -Architecture arm64
+        run: ./build_windows_app.ps1 -Architecture arm64 -StagingName $env:FILEMCP_WINDOWS_STAGING_NAME
 
       - name: Windows app smoke test
         shell: pwsh
@@ -115,7 +154,7 @@ jobs:
             }
           }
           foreach ($arch in @("x64", "arm64")) {
-            $root = "dist/windows-$arch/FileMCP"
+            $root = "dist/windows-$arch/$env:FILEMCP_WINDOWS_STAGING_NAME"
             if (-not (Test-Path "$root/FileMCP.exe" -PathType Leaf)) { throw "Missing FileMCP.exe for $arch." }
             if (-not (Test-Path "$root/tunnel-client.exe" -PathType Leaf)) { throw "Missing tunnel-client.exe for $arch." }
             Assert-SameFile LICENSE "$root/FileMCP-LICENSE.txt"
@@ -131,6 +170,88 @@ jobs:
           name: FileMCP-windows-x64
           path: dist/FileMCP-v0.4.0-windows-x64.zip
           if-no-files-found: error
+  verify-windows-arm64:
+    runs-on: windows-11-vs2026-arm
+    timeout-minutes: 20
+    env:
+      FILEMCP_WINDOWS_STAGING_NAME: FileMCP-release
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Verify native ARM64 runner and vendored tunnel-client
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($architecture -ne "Arm64") { throw "Expected native Windows ARM64 runner, got $architecture." }
+          if ((Get-Content vendor/tunnel-client/VERSION -Raw).Trim() -ne "0.0.12") { throw "Unexpected tunnel-client version." }
+          if ((Get-FileHash vendor/tunnel-client/windows-arm64/tunnel-client.exe -Algorithm SHA256).Hash.ToLowerInvariant() -ne "480684ec1031fc2985c7e87f9d669e7dfda4012a8ecdab21eabe1b5deafdd656") { throw "windows-arm64 tunnel-client checksum mismatch." }
+          $version = & vendor/tunnel-client/windows-arm64/tunnel-client.exe --version
+          if ($version -notmatch '^0\.0\.12\+881c9a8fed7cccbe6607cd419863bbca506b8215 ') { throw "Unexpected ARM64 tunnel-client version output: $version" }
+          if (-not (Test-Path vendor/tunnel-client/NOTICE -PathType Leaf)) { throw "Missing NOTICE." }
+          if (-not (Test-Path vendor/tunnel-client/windows-arm64/THIRD-PARTY-LICENSES.txt -PathType Leaf)) { throw "Missing windows-arm64 license sidecar." }
+          Write-Host "windows-native-arm64-runner: ok"
+
+      - name: Build Windows solution
+        shell: pwsh
+        run: dotnet build windows/FileMCP.Windows.sln -c Release -warnaserror
+
+      - name: Verify Windows release contract
+        shell: pwsh
+        run: ./tests/test_windows_release_contract.ps1
+
+      - name: Verify dynamic health discovery contract
+        shell: pwsh
+        run: ./tests/test_dynamic_health_discovery_contract.ps1
+
+      - name: Verify Windows ARM64 assurance contract
+        shell: pwsh
+        run: ./tests/test_windows_arm64_assurance_contract.ps1
+
+      - name: Verify Windows single-instance contract
+        shell: pwsh
+        run: ./tests/test_windows_single_instance_contract.ps1
+
+      - name: Verify production release signing contract
+        shell: pwsh
+        run: ./tests/test_release_signing_contract.ps1
+
+      - name: Verify release secret provisioning contract
+        shell: pwsh
+        run: ./tests/test_release_secret_provisioning_contract.ps1
+
+      - name: Build Windows ARM64 release
+        shell: pwsh
+        run: ./build_windows_app.ps1 -Architecture arm64 -StagingName $env:FILEMCP_WINDOWS_STAGING_NAME
+
+      - name: Windows ARM64 app smoke test
+        shell: pwsh
+        run: ./tests/test_windows_app.ps1 -Architecture arm64
+
+      - name: Verify Windows ARM64 release resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Assert-SameFile([string]$Expected, [string]$Actual) {
+            if ((Get-FileHash $Expected -Algorithm SHA256).Hash -ne (Get-FileHash $Actual -Algorithm SHA256).Hash) {
+              throw "Release file mismatch: $Expected vs $Actual"
+            }
+          }
+          $root = "dist/windows-arm64/$env:FILEMCP_WINDOWS_STAGING_NAME"
+          if (-not (Test-Path "$root/FileMCP.exe" -PathType Leaf)) { throw "Missing ARM64 FileMCP.exe." }
+          if (-not (Test-Path "$root/tunnel-client.exe" -PathType Leaf)) { throw "Missing ARM64 tunnel-client.exe." }
+          Assert-SameFile LICENSE "$root/FileMCP-LICENSE.txt"
+          Assert-SameFile vendor/tunnel-client/LICENSE "$root/tunnel-client-LICENSE.txt"
+          Assert-SameFile vendor/tunnel-client/NOTICE "$root/tunnel-client-NOTICE.txt"
+          Assert-SameFile vendor/tunnel-client/windows-arm64/THIRD-PARTY-LICENSES.txt "$root/tunnel-client-THIRD-PARTY-LICENSES.txt"
+          Assert-SameFile vendor/opentelemetry/LICENSE.txt "$root/OpenTelemetry-LICENSE.txt"
+          Assert-SameFile vendor/opentelemetry/THIRD-PARTY-NOTICES.txt "$root/OpenTelemetry-THIRD-PARTY-NOTICES.txt"
 
       - name: Upload Windows ARM64 package
         uses: actions/upload-artifact@v4

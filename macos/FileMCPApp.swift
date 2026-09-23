@@ -605,7 +605,7 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
 
     @objc private func startTunnel() {
         switch runtime.state {
-        case .running, .starting:
+        case .running, .starting, .restarting, .cooldown:
             runtime.stop()
             return
         case .stopping:
@@ -759,7 +759,7 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
             startButton.title = "Connect"; startButton.bezelColor = .controlAccentColor; startButton.isEnabled = true
         case .starting:
             startButton.title = "Connecting…"; startButton.bezelColor = .controlAccentColor; startButton.isEnabled = false
-        case .running:
+        case .running, .restarting, .cooldown:
             startButton.title = "Disconnect"; startButton.bezelColor = .systemRed; startButton.isEnabled = true
         case .stopping:
             startButton.title = "Disconnecting…"; startButton.bezelColor = .systemRed; startButton.isEnabled = false

@@ -79,7 +79,7 @@ Launch it with:
 open "dist/FileMCP.app"
 ```
 
-The local build is unsigned. Distribution builds should be code-signed and notarized using the normal macOS release process.
+The local build is unsigned. If trusted public-market distribution is required in the future, builds should be code-signed and notarized using the normal macOS release process.
 
 ### Windows
 
@@ -98,9 +98,11 @@ For Windows ARM64:
 Release outputs are created under:
 
 ```text
-dist/windows-x64/FileMCP/
-dist/windows-arm64/FileMCP/
+dist/windows-x64/FileMCP-release/
+dist/windows-arm64/FileMCP-release/
 ```
+
+Build output uses a release staging directory so packaging does not overwrite a FileMCP executable that may currently be running from an older build.
 
 and packaged as:
 
@@ -109,7 +111,7 @@ dist/FileMCP-v0.4.0-windows-x64.zip
 dist/FileMCP-v0.4.0-windows-arm64.zip
 ```
 
-The Windows app is self-contained, so end users do not need to install .NET separately. Local builds are unsigned; production distribution should Authenticode-sign the executable/package.
+The Windows app is self-contained, so end users do not need to install .NET separately. Local builds are unsigned; if trusted public-market distribution is required in the future, the executable/package should be Authenticode-signed.
 
 For a development run on Windows:
 
@@ -141,7 +143,7 @@ The common workflow and terminology are kept aligned across macOS and Windows. T
 | Allow shell commands | Enables `run_command`; disabled by default. |
 | Profile | FileMCP-owned `tunnel-client` profile name; letters/numbers plus `.`, `_`, `-`, maximum 128 characters. |
 | MCP port | Local loopback port used by the MCP server. |
-| Health listener | Loopback-only `tunnel-client` health/admin listener. Port `0` requests an ephemeral port. |
+| Health listener | Loopback-only `tunnel-client` health/admin listener. Port `0` requests an ephemeral port; Windows discovers the resolved loopback endpoint via tunnel-client health URL-file output and probes it automatically. |
 | Git name / Git email | Optional Git identity used by `git_commit`. |
 
 Closing the main window does not stop an active tunnel:
@@ -396,6 +398,37 @@ The script requires a clean working tree and uses `git archive`, preventing loca
 Do not create public release archives by zipping the entire working directory.
 
 Platform release builds are intentionally separate because signing/notarization requirements differ between macOS and Windows.
+
+### Production signing / notarization
+
+Ordinary local builds and the Verify workflow intentionally remain unsigned. The current accepted product scope is unsigned developer/internal/direct-use distribution (ADR-0003). The separate manual Production Release workflow in .github/workflows/release.yml and the protected GitHub Environment production-release are retained as an optional future path if trusted public-market distribution is later required.
+
+If that optional signed-distribution path is activated, configure these Environment secrets before running the production workflow:
+
+| Platform | Secret | Purpose |
+| --- | --- | --- |
+| Windows | WINDOWS_CODESIGN_PFX_BASE64 | Base64 PKCS#12/PFX containing the public code-signing certificate and private key. |
+| Windows | WINDOWS_CODESIGN_PFX_PASSWORD | Password for the PFX. |
+| macOS | MACOS_DEVELOPER_ID_P12_BASE64 | Base64 Developer ID Application PKCS#12/P12. |
+| macOS | MACOS_DEVELOPER_ID_P12_PASSWORD | Password for the Developer ID P12. |
+| macOS | APPLE_NOTARY_KEY_P8_BASE64 | Base64 App Store Connect API private key (.p8) used by notarytool. |
+| macOS | APPLE_NOTARY_KEY_ID | App Store Connect API key ID. |
+| macOS | APPLE_NOTARY_ISSUER_ID | App Store Connect API issuer ID. |
+
+The release workflow is workflow_dispatch-only. It materializes credential files only under the ephemeral runner temp directory and cleans them after the job. Windows artifacts are Authenticode signed, RFC3161 timestamped, repackaged, then verified again from inside the ZIP. macOS artifacts are Developer ID signed with the hardened runtime, notarized, stapled, assessed by Gatekeeper, packaged after stapling, then reverified from the final ZIP.
+
+Do not add PFX/P12/P8 files to the repository. For the current unsigned scope, FPA-004 is OUT-OF-SCOPE rather than PASS. If signed public-market distribution is reintroduced, FPA-004 must be reopened and cannot pass until a real credentialed production-release run succeeds and the uploaded artifacts pass the post-package signature/notarization checks.
+
+To provision the seven Environment secrets without pasting private material into chat or command history, keep the PFX/P12/P8 files outside this repository and run:
+
+```powershell
+.\release\configure_production_release_secrets.ps1 `
+  -WindowsPfxPath "C:\secure\filemcp-code-signing.pfx" `
+  -MacDeveloperIdP12Path "C:\secure\developer-id-application.p12" `
+  -AppleNotaryP8Path "C:\secure\AuthKey_private.p8"
+```
+
+The helper prompts for the Windows/macOS certificate passwords and Apple notarization identifiers, streams secret values directly to GitHub Environment secrets, prints only secret names, and never writes credential copies into the repository. After provisioning, it automatically runs `release/check_production_release_readiness.ps1`. Add `-Dispatch` only when you intentionally want it to dispatch Production Release version 0.4.0 after readiness succeeds.
 
 ## Contributing
 

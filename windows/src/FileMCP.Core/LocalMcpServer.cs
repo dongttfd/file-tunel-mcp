@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
@@ -11,6 +12,18 @@ internal sealed record HttpRequestData(string Method, string Path, Dictionary<st
 internal enum HttpParseStatus { Incomplete, Request, Failure }
 internal sealed record HttpParseResult(HttpParseStatus Status, HttpRequestData? Request = null, int FailureStatus = 0, string? FailureMessage = null);
 
+internal sealed record LocalMcpServerLimits(int MaxConcurrentConnections, TimeSpan ReadIdleTimeout, TimeSpan HeaderReadTimeout)
+{
+    public static LocalMcpServerLimits Default { get; } = new(64, TimeSpan.FromSeconds(15), TimeSpan.FromSeconds(30));
+
+    public void Validate()
+    {
+        if (MaxConcurrentConnections <= 0) throw new ArgumentOutOfRangeException(nameof(MaxConcurrentConnections));
+        if (ReadIdleTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(ReadIdleTimeout));
+        if (HeaderReadTimeout <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(HeaderReadTimeout));
+    }
+}
+
 public sealed class LocalMcpServer : IAsyncDisposable
 {
     private static readonly HashSet<string> UnauthenticatedOAuthDiscoveryPaths = new(StringComparer.Ordinal)
@@ -21,21 +34,36 @@ public sealed class LocalMcpServer : IAsyncDisposable
     private static readonly HashSet<string> SingleValueHeaders = new(StringComparer.OrdinalIgnoreCase)
     {
         "content-length", "content-type", "host", "origin", "mcp-protocol-version", "mcp-method", "mcp-name",
-        "transfer-encoding", FileMcpConstants.LocalAuthHeaderName.ToLowerInvariant(),
+        "transfer-encoding", "traceparent", "tracestate", FileMcpConstants.LocalAuthHeaderName.ToLowerInvariant(),
     };
     private readonly ushort _port;
     private readonly string _localAuthToken;
     private readonly LocalTools _tools;
     private readonly CodexSkillRegistry _skills;
     private readonly Action<string> _log;
+    private readonly WorkspaceUsageMeter? _usageMeter;
+    private readonly LogicalChatCorrelationService? _chatCorrelation;
+    private readonly LogicalSessionRegistry? _sessions;
+    private readonly string? _workspaceKey;
+    private readonly McpStandardTelemetry? _standardTelemetry;
+    private readonly LocalMcpServerLimits _limits;
+    private readonly SemaphoreSlim _connectionSlots;
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
     private Task? _acceptLoop;
 
-    public LocalMcpServer(ushort port, string allowedDirectory, string gitUserName, string gitUserEmail, bool enableCommands, string localAuthToken, Action<string> log)
+    public LocalMcpServer(ushort port, string allowedDirectory, string gitUserName, string gitUserEmail, bool enableCommands, string localAuthToken, Action<string> log, WorkspaceUsageMeter? usageMeter = null, LogicalChatCorrelationService? chatCorrelation = null, LogicalSessionRegistry? sessions = null, string? workspaceKey = null, McpStandardTelemetry? standardTelemetry = null)
+        : this(port, allowedDirectory, gitUserName, gitUserEmail, enableCommands, localAuthToken, log, usageMeter, chatCorrelation, sessions, workspaceKey, standardTelemetry, LocalMcpServerLimits.Default)
+    {
+    }
+
+    internal LocalMcpServer(ushort port, string allowedDirectory, string gitUserName, string gitUserEmail, bool enableCommands, string localAuthToken, Action<string> log, WorkspaceUsageMeter? usageMeter, LogicalChatCorrelationService? chatCorrelation, LogicalSessionRegistry? sessions, string? workspaceKey, McpStandardTelemetry? standardTelemetry, LocalMcpServerLimits limits)
     {
         if (Encoding.UTF8.GetByteCount(localAuthToken) < 32) throw new FileMcpException("Local MCP authentication token is too short");
-        _port = port; _localAuthToken = localAuthToken; _log = log;
+        limits.Validate();
+        _port = port; _localAuthToken = localAuthToken; _log = log; _usageMeter = usageMeter; _chatCorrelation = chatCorrelation; _sessions = sessions; _workspaceKey = string.IsNullOrWhiteSpace(workspaceKey) ? null : workspaceKey.Trim().ToUpperInvariant(); _standardTelemetry = standardTelemetry;
+        _limits = limits;
+        _connectionSlots = new SemaphoreSlim(limits.MaxConcurrentConnections, limits.MaxConcurrentConnections);
         _tools = new LocalTools(allowedDirectory, gitUserName, gitUserEmail, enableCommands);
         _skills = new CodexSkillRegistry(allowedDirectory, log);
     }
@@ -80,7 +108,16 @@ public sealed class LocalMcpServer : IAsyncDisposable
             catch (OperationCanceledException) { return; }
             catch (ObjectDisposedException) { return; }
             catch (SocketException) when (cancellationToken.IsCancellationRequested) { return; }
-            _ = Task.Run(() => HandleClientAsync(client, cancellationToken), CancellationToken.None);
+            if (!_connectionSlots.Wait(0))
+            {
+                client.Dispose();
+                continue;
+            }
+            _ = Task.Run(async () =>
+            {
+                try { await HandleClientAsync(client, cancellationToken).ConfigureAwait(false); }
+                finally { _connectionSlots.Release(); }
+            }, CancellationToken.None);
         }
     }
 
@@ -92,10 +129,13 @@ public sealed class LocalMcpServer : IAsyncDisposable
             var stream = client.GetStream();
             var buffer = new MemoryStream();
             var readBuffer = new byte[65_536];
+            var headerStartedAt = Stopwatch.GetTimestamp();
             while (!cancellationToken.IsCancellationRequested)
             {
+                var currentBytes = buffer.ToArray();
+                var headerComplete = IndexOf(currentBytes, "\r\n\r\n"u8.ToArray()) >= 0;
                 HttpParseResult parsed;
-                try { parsed = ParseHttpRequest(buffer.ToArray()); }
+                try { parsed = ParseHttpRequest(currentBytes); }
                 catch { parsed = new HttpParseResult(HttpParseStatus.Failure, FailureStatus: 400, FailureMessage: "Malformed request"); }
                 if (parsed.Status == HttpParseStatus.Request)
                 {
@@ -124,8 +164,19 @@ public sealed class LocalMcpServer : IAsyncDisposable
                     await stream.WriteAsync(response, cancellationToken).ConfigureAwait(false);
                     return;
                 }
+                var readTimeout = _limits.ReadIdleTimeout;
+                if (!headerComplete)
+                {
+                    var remainingHeader = _limits.HeaderReadTimeout - Stopwatch.GetElapsedTime(headerStartedAt);
+                    if (remainingHeader <= TimeSpan.Zero) return;
+                    if (remainingHeader < readTimeout) readTimeout = remainingHeader;
+                }
+
+                using var readCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                readCts.CancelAfter(readTimeout);
                 int read;
-                try { read = await stream.ReadAsync(readBuffer, cancellationToken).ConfigureAwait(false); }
+                try { read = await stream.ReadAsync(readBuffer, readCts.Token).ConfigureAwait(false); }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return; }
                 catch (OperationCanceledException) { return; }
                 if (read <= 0) return;
                 buffer.Write(readBuffer, 0, read);
@@ -196,83 +247,241 @@ public sealed class LocalMcpServer : IAsyncDisposable
         catch { return JsonRpcError(null, -32700, "Parse error", status: 400); }
         if (message["jsonrpc"]?.GetValue<string>() != "2.0") return JsonRpcError(null, -32600, "Invalid Request", status: 400);
         if (message["method"] is not JsonValue methodNode || !methodNode.TryGetValue<string>(out var method)) return JsonRpcError(message["id"], -32600, "Invalid Request", status: 400);
+
+        RecordRequestSafely(request.Body.LongLength);
         var id = message["id"]?.DeepClone();
         var headerVersion = request.Headers.GetValueOrDefault("mcp-protocol-version");
         var headerModern = headerVersion is not null && !FileMcpConstants.LegacySupportedVersions.Contains(headerVersion);
         JsonObject parameters;
         if (message["params"] is null) parameters = new JsonObject();
         else if (message["params"] is JsonObject obj) parameters = obj;
-        else return JsonRpcError(id, -32602, "Invalid params: expected an object", status: headerModern ? 400 : 200);
+        else return MeterResponse(JsonRpcError(id, -32602, "Invalid params: expected an object", status: headerModern ? 400 : 200));
         var meta = parameters["_meta"] as JsonObject; var bodyVersion = meta?["io.modelcontextprotocol/protocolVersion"]?.GetValue<string>();
         var bodyModern = bodyVersion is not null && !FileMcpConstants.LegacySupportedVersions.Contains(bodyVersion); var modernIntent = headerModern || bodyModern;
-        if (modernIntent && headerVersion is not null && bodyVersion is not null && headerVersion != bodyVersion) return HeaderMismatch(id, $"MCP-Protocol-Version header '{headerVersion}' does not match body protocol version '{bodyVersion}'");
-        if (headerVersion is not null && headerVersion != FileMcpConstants.ModernProtocolVersion && !FileMcpConstants.LegacySupportedVersions.Contains(headerVersion)) return UnsupportedProtocol(id, headerVersion);
+        string? requestedLegacyVersion = null;
+        if (parameters["protocolVersion"] is JsonValue requestedProtocol && requestedProtocol.TryGetValue<string>(out var requestedProtocolText))
+            requestedLegacyVersion = requestedProtocolText;
+        string? telemetryToolName = null;
+        if (method == "tools/call" && parameters["name"] is JsonValue telemetryToolNode && telemetryToolNode.TryGetValue<string>(out var telemetryToolText))
+            telemetryToolName = telemetryToolText;
+        McpExtractedTraceContext? traceContext = McpTraceContextAdapter.TryExtract(meta, request.Headers, out var extractedTraceContext)
+            ? extractedTraceContext
+            : null;        using var standardOperation = BeginStandardTelemetrySafely(
+            headerVersion ?? bodyVersion ?? requestedLegacyVersion,
+            method,
+            telemetryToolName,
+            request.Body.LongLength,
+            traceContext);
+
+        byte[] FinishStandard(byte[] response)
+        {
+            CompleteStandardTelemetrySafely(standardOperation, response);
+            return response;
+        }
+
+        if (modernIntent && headerVersion is not null && bodyVersion is not null && headerVersion != bodyVersion) return FinishStandard(MeterResponse(HeaderMismatch(id, $"MCP-Protocol-Version header '{headerVersion}' does not match body protocol version '{bodyVersion}'")));
+        if (headerVersion is not null && headerVersion != FileMcpConstants.ModernProtocolVersion && !FileMcpConstants.LegacySupportedVersions.Contains(headerVersion)) return FinishStandard(MeterResponse(UnsupportedProtocol(id, headerVersion)));
         if (modernIntent)
         {
-            var error = ValidateModernRequest(request, method, parameters, id); if (error is not null) return error;
-            if (message["id"] is null) return HttpResponse(202, [], "application/json");
-            return await ProcessModernRequestAsync(id, method, parameters, cancellationToken).ConfigureAwait(false);
+            var error = ValidateModernRequest(request, method, parameters, id); if (error is not null) return FinishStandard(MeterResponse(error));
+            if (message["id"] is null) return FinishStandard(MeterResponse(HttpResponse(202, [], "application/json")));
+            return FinishStandard(MeterResponse(await ProcessModernRequestAsync(id, method, parameters, request.Body.LongLength, cancellationToken).ConfigureAwait(false)));
         }
-        if (message["id"] is null) return HttpResponse(202, [], "application/json");
-        return await ProcessLegacyRequestAsync(id, method, parameters, cancellationToken).ConfigureAwait(false);
+        if (message["id"] is null) return FinishStandard(MeterResponse(HttpResponse(202, [], "application/json")));
+        return FinishStandard(MeterResponse(await ProcessLegacyRequestAsync(id, method, parameters, request.Body.LongLength, cancellationToken).ConfigureAwait(false)));
     }
-
-    private async Task<byte[]> ProcessLegacyRequestAsync(JsonNode? id, string method, JsonObject parameters, CancellationToken cancellationToken) => method switch
+    private async Task<byte[]> ProcessLegacyRequestAsync(JsonNode? id, string method, JsonObject parameters, long requestBytes, CancellationToken cancellationToken) => method switch
     {
         "initialize" => JsonRpcResult(id, new JsonObject { ["protocolVersion"] = NegotiateLegacy(parameters["protocolVersion"]?.GetValue<string>()), ["capabilities"] = ServerCapabilities(), ["serverInfo"] = ServerInfo() }),
         "ping" => JsonRpcResult(id, new JsonObject()),
         "tools/list" => JsonRpcResult(id, new JsonObject { ["tools"] = AllToolDefinitions() }),
-        "tools/call" => await CallToolAsync(id, parameters, false, cancellationToken).ConfigureAwait(false),
+        "tools/call" => await CallToolAsync(id, parameters, false, requestBytes, cancellationToken).ConfigureAwait(false),
         _ => JsonRpcError(id, -32601, $"Method not found: {method}"),
     };
 
-    private async Task<byte[]> ProcessModernRequestAsync(JsonNode? id, string method, JsonObject parameters, CancellationToken cancellationToken)
+    private async Task<byte[]> ProcessModernRequestAsync(JsonNode? id, string method, JsonObject parameters, long requestBytes, CancellationToken cancellationToken)
     {
         if (method == "server/discover")
         {
+            var instructions = "Read and manage files, Git repositories, Codex project skills, and optionally local commands inside the configured shared directory. When a user message begins with '/<skill-name>', call load_codex_skill with that exact name before answering and follow the returned SKILL.md instructions.";
+            if (_chatCorrelation is not null)
+                instructions += " For local observability, call filemcp_observability_connect once for this chat context, then include the returned chat_instance_id as _filemcp_chat on later FileMCP tool calls. The handle is correlation metadata only and grants no additional authority.";
             var result = ModernComplete(new JsonObject
             {
                 ["supportedVersions"] = new JsonArray(FileMcpConstants.ModernProtocolVersion),
                 ["capabilities"] = ServerCapabilities(),
-                ["instructions"] = "Read and manage files, Git repositories, Codex project skills, and optionally local commands inside the configured shared directory. When a user message begins with '/<skill-name>', call load_codex_skill with that exact name before answering and follow the returned SKILL.md instructions.",
+                ["instructions"] = instructions,
             });
             result["ttlMs"] = 60_000; result["cacheScope"] = "private"; return JsonRpcResult(id, result);
         }
         if (method == "ping") return JsonRpcResult(id, ModernComplete(new JsonObject()));
         if (method == "tools/list") { var result = ModernComplete(new JsonObject { ["tools"] = AllToolDefinitions() }); result["ttlMs"] = 30_000; result["cacheScope"] = "private"; return JsonRpcResult(id, result); }
-        if (method == "tools/call") return await CallToolAsync(id, parameters, true, cancellationToken).ConfigureAwait(false);
+        if (method == "tools/call") return await CallToolAsync(id, parameters, true, requestBytes, cancellationToken).ConfigureAwait(false);
         return JsonRpcError(id, -32601, $"Method not found: {method}", status: 404);
     }
 
     private JsonArray AllToolDefinitions()
     {
         var result = new JsonArray();
-        foreach (var tool in _tools.ToolDefinitions) result.Add(tool?.DeepClone());
-        foreach (var tool in _skills.ToolDefinitions) result.Add(tool?.DeepClone());
+        foreach (var tool in _tools.ToolDefinitions) result.Add(WithCorrelationFacadeMetadata(tool));
+        foreach (var tool in _skills.ToolDefinitions) result.Add(WithCorrelationFacadeMetadata(tool));
+        if (_chatCorrelation is not null) result.Add(ObservabilityConnectToolDefinition());
         return result;
     }
 
-    private async Task<byte[]> CallToolAsync(JsonNode? id, JsonObject parameters, bool modern, CancellationToken cancellationToken)
+    private JsonNode? WithCorrelationFacadeMetadata(JsonNode? source)
     {
-        if (parameters["name"] is not JsonValue nameNode || !nameNode.TryGetValue<string>(out var name)) return JsonRpcError(id, -32602, "Missing tool name", status: modern ? 400 : 200);
-        if (!_tools.HasTool(name) && !_skills.HasTool(name)) return JsonRpcError(id, -32602, $"Unknown tool: {name}");
-        JsonObject arguments;
-        if (parameters["arguments"] is null) arguments = new JsonObject();
-        else if (parameters["arguments"] is JsonObject obj) arguments = obj;
-        else { var invalid = new JsonObject { ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "Invalid arguments: expected an object" }), ["isError"] = true }; if (modern) invalid = ModernComplete(invalid); return JsonRpcResult(id, invalid); }
+        var clone = source?.DeepClone();
+        if (_chatCorrelation is null || clone is not JsonObject tool) return clone;
+        if (tool["inputSchema"] is not JsonObject inputSchema) return clone;
+        if (inputSchema["properties"] is not JsonObject properties) return clone;
+        properties["_filemcp_chat"] = new JsonObject
+        {
+            ["type"] = "string",
+            ["description"] = "Optional opaque FileMCP correlation handle returned by filemcp_observability_connect. It is observability metadata only and grants no additional authority.",
+        };
+        return clone;
+    }
+
+    private static JsonObject ObservabilityConnectToolDefinition() => new()
+    {
+        ["name"] = "filemcp_observability_connect",
+        ["description"] = "Establish or resume an opaque FileMCP logical-chat correlation handle for local observability. This handle is metadata only and never grants file, Git, or command permissions.",
+        ["inputSchema"] = new JsonObject
+        {
+            ["type"] = "object",
+            ["properties"] = new JsonObject
+            {
+                ["chat_instance_id"] = new JsonObject
+                {
+                    ["type"] = "string",
+                    ["description"] = "Optional prior FileMCP chat correlation handle to resume within this FileMCP process.",
+                },
+            },
+            ["required"] = new JsonArray(),
+            ["additionalProperties"] = false,
+        },
+        ["outputSchema"] = new JsonObject
+        {
+            ["type"] = "object",
+            ["properties"] = new JsonObject
+            {
+                ["chat_instance_id"] = new JsonObject { ["type"] = "string" },
+                ["resumed"] = new JsonObject { ["type"] = "boolean" },
+            },
+            ["required"] = new JsonArray("chat_instance_id", "resumed"),
+            ["additionalProperties"] = false,
+        },
+        ["annotations"] = new JsonObject { ["readOnlyHint"] = true, ["destructiveHint"] = false, ["openWorldHint"] = false },
+    };
+
+    private async Task<byte[]> CallToolAsync(JsonNode? id, JsonObject parameters, bool modern, long requestBytes, CancellationToken cancellationToken)
+    {
+        var started = Stopwatch.GetTimestamp();
+        string? name = null;
+        var isError = true;
+        LogicalSessionCallToken? sessionCall = null;
+        byte[]? response = null;
         try
         {
-            var output = _skills.HasTool(name)
-                ? _skills.Call(name, arguments)
-                : await _tools.CallAsync(name, arguments, cancellationToken).ConfigureAwait(false);
-            var result = new JsonObject { ["content"] = output.Content, ["structuredContent"] = output.StructuredContent, ["isError"] = false };
-            if (modern) result = ModernComplete(result); return JsonRpcResult(id, result);
+            if (parameters["name"] is not JsonValue nameNode || !nameNode.TryGetValue<string>(out name))
+                return response = JsonRpcError(id, -32602, "Missing tool name", status: modern ? 400 : 200);
+
+            var isObservabilityConnect = name == "filemcp_observability_connect" && _chatCorrelation is not null;
+            if (!_tools.HasTool(name) && !_skills.HasTool(name) && !isObservabilityConnect)
+                return response = JsonRpcError(id, -32602, $"Unknown tool: {name}");
+
+            JsonObject arguments;
+            if (parameters["arguments"] is null) arguments = new JsonObject();
+            else if (parameters["arguments"] is JsonObject obj) arguments = (JsonObject)obj.DeepClone();
+            else
+            {
+                var invalid = new JsonObject
+                {
+                    ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "Invalid arguments: expected an object" }),
+                    ["isError"] = true,
+                };
+                if (modern) invalid = ModernComplete(invalid);
+                return response = JsonRpcResult(id, invalid);
+            }
+
+            try
+            {
+                if (isObservabilityConnect)
+                {
+                    foreach (var key in arguments.Select(pair => pair.Key).ToArray())
+                        if (key != "chat_instance_id") throw new FileMcpException($"Unknown argument: {key}");
+
+                    string? requested = null;
+                    if (arguments["chat_instance_id"] is JsonNode requestedNode)
+                    {
+                        if (requestedNode is not JsonValue requestedValue || !requestedValue.TryGetValue<string>(out requested))
+                            throw new FileMcpException("Argument chat_instance_id must be a string");
+                    }
+
+                    var connection = _chatCorrelation!.Connect(requested);
+                    if (_sessions is not null && _workspaceKey is not null)
+                    {
+                        var sessionHash = LogicalChatCorrelationService.HashForPersistence(connection.ChatInstanceId);
+                        _sessions.RegisterSession(sessionHash);
+                        sessionCall = _sessions.BeginToolCall(_workspaceKey, sessionHash, requestBytes, name);
+                    }
+
+                    var structured = new JsonObject
+                    {
+                        ["chat_instance_id"] = connection.ChatInstanceId,
+                        ["resumed"] = connection.Resumed,
+                    };
+                    var result = new JsonObject
+                    {
+                        ["content"] = new JsonArray(new JsonObject
+                        {
+                            ["type"] = "text",
+                            ["text"] = structured.ToJsonString(),
+                        }),
+                        ["structuredContent"] = structured,
+                        ["isError"] = false,
+                    };
+                    if (modern) result = ModernComplete(result);
+                    isError = false;
+                    return response = JsonRpcResult(id, result);
+                }
+
+                string? sessionHashForCall = null;
+                var correlationNode = arguments["_filemcp_chat"];
+                arguments.Remove("_filemcp_chat");
+                if (correlationNode is JsonValue correlationValue && correlationValue.TryGetValue<string>(out var correlationHandle) &&
+                    _chatCorrelation?.TryResolve(correlationHandle, out var resolvedHash) == true)
+                    sessionHashForCall = resolvedHash;
+
+                if (_sessions is not null && _workspaceKey is not null)
+                    sessionCall = _sessions.BeginToolCall(_workspaceKey, sessionHashForCall, requestBytes, name);
+
+                var output = _skills.HasTool(name)
+                    ? _skills.Call(name, arguments)
+                    : await _tools.CallAsync(name, arguments, cancellationToken).ConfigureAwait(false);
+                var toolResult = new JsonObject { ["content"] = output.Content, ["structuredContent"] = output.StructuredContent, ["isError"] = false };
+                if (modern) toolResult = ModernComplete(toolResult);
+                isError = false;
+                return response = JsonRpcResult(id, toolResult);
+            }
+            catch (Exception ex)
+            {
+                if (_skills.HasTool(name)) _log($"[Skills] ERROR: {ex.Message}\n");
+                var result = new JsonObject { ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = ex.Message }), ["isError"] = true };
+                if (modern) result = ModernComplete(result);
+                return response = JsonRpcResult(id, result);
+            }
         }
-        catch (Exception ex)
+        finally
         {
-            if (_skills.HasTool(name)) _log($"[Skills] ERROR: {ex.Message}\n");
-            var result = new JsonObject { ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = ex.Message }), ["isError"] = true };
-            if (modern) result = ModernComplete(result); return JsonRpcResult(id, result);
+            var latency = Math.Max(0, Stopwatch.GetTimestamp() - started);
+            RecordToolCallSafely(name, isError, latency);
+            if (sessionCall.HasValue && response is not null)
+            {
+                try { _sessions?.CompleteToolCall(sessionCall.Value, HttpBodyByteLength(response), isError, latency); }
+                catch (Exception ex) { _log($"[Telemetry] session metric ignored: {ex.Message}\n"); }
+            }
         }
     }
 
@@ -346,6 +555,76 @@ public sealed class LocalMcpServer : IAsyncDisposable
     private static byte[] JsonRpcError(JsonNode? id, int code, string message, JsonNode? data = null, int status = 200) { var error = new JsonObject { ["code"] = code, ["message"] = message }; if (data is not null) error["data"] = data; return JsonResponse(new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id?.DeepClone(), ["error"] = error }, status); }
     private static byte[] JsonResponse(JsonNode node, int status = 200) => HttpResponse(status, Encoding.UTF8.GetBytes(node.ToJsonString()), "application/json");
 
+    private byte[] MeterResponse(byte[] response)
+    {
+        try
+        {
+            _usageMeter?.RecordResponse(HttpBodyByteLength(response));
+        }
+        catch (Exception ex)
+        {
+            _log($"[Telemetry] response metric ignored: {ex.Message}\n");
+        }
+        return response;
+    }
+
+    private McpStandardTelemetryOperation? BeginStandardTelemetrySafely(string? protocolVersion, string? method, string? toolName, long requestBytes, McpExtractedTraceContext? traceContext)
+    {
+        try { return _standardTelemetry?.BeginOperation(protocolVersion, method, toolName, _workspaceKey, requestBytes, traceContext); }
+        catch (Exception ex) { _log($"[Telemetry] standard operation start ignored: {ex.Message}\n"); return null; }
+    }
+
+    private void CompleteStandardTelemetrySafely(McpStandardTelemetryOperation? operation, byte[] response)
+    {
+        if (operation is null) return;
+        try { operation.Complete(HttpBodyByteLength(response), IsMcpErrorResponse(response)); }
+        catch (Exception ex) { _log($"[Telemetry] standard operation metric ignored: {ex.Message}\n"); }
+    }
+
+    private static bool IsMcpErrorResponse(byte[] response)
+    {
+        var separator = Encoding.ASCII.GetBytes("\r\n\r\n");
+        var bodyIndex = IndexOf(response, separator);
+        if (bodyIndex < 0) return true;
+        var firstLineEnd = IndexOf(response, Encoding.ASCII.GetBytes("\r\n"));
+        if (firstLineEnd > 0)
+        {
+            var firstLine = Encoding.ASCII.GetString(response, 0, firstLineEnd);
+            var parts = firstLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length >= 2 && int.TryParse(parts[1], out var status) && status >= 400) return true;
+        }
+        try
+        {
+            var bodyStart = bodyIndex + separator.Length;
+            if (bodyStart >= response.Length) return false;
+            var node = JsonNode.Parse(response.AsSpan(bodyStart));
+            if (node is not JsonObject root) return false;
+            if (root["error"] is not null) return true;
+            if (root["result"] is JsonObject result && result["isError"] is JsonValue value && value.TryGetValue<bool>(out var isError))
+                return isError;
+        }
+        catch { }
+        return false;
+    }
+
+    private void RecordRequestSafely(long requestBytes)
+    {
+        try { _usageMeter?.RecordRequest(requestBytes); }
+        catch (Exception ex) { _log($"[Telemetry] request metric ignored: {ex.Message}\n"); }
+    }
+
+    private void RecordToolCallSafely(string? name, bool isError, long latencyTicks)
+    {
+        try { _usageMeter?.RecordToolCall(name, isError, latencyTicks); }
+        catch (Exception ex) { _log($"[Telemetry] tool metric ignored: {ex.Message}\n"); }
+    }
+
+    private static int HttpBodyByteLength(byte[] response)
+    {
+        var separator = Encoding.ASCII.GetBytes("\r\n\r\n");
+        var index = IndexOf(response, separator);
+        return index < 0 ? 0 : response.Length - index - separator.Length;
+    }
     private static byte[] HttpResponse(int status, byte[] body, string contentType)
     {
         var reason = status switch { 200 => "OK", 202 => "Accepted", 204 => "No Content", 400 => "Bad Request", 401 => "Unauthorized", 403 => "Forbidden", 404 => "Not Found", 405 => "Method Not Allowed", 413 => "Payload Too Large", 415 => "Unsupported Media Type", 431 => "Request Header Fields Too Large", 500 => "Internal Server Error", _ => "Error" };

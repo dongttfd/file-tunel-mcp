@@ -1512,16 +1512,75 @@ private enum HTTPRequestParseResult {
     case failure(status: Int, message: String)
 }
 
+struct LocalMCPServerLimits {
+    let maxConcurrentConnections: Int
+    let readIdleTimeout: TimeInterval
+    let headerReadTimeout: TimeInterval
+
+    static let standard = LocalMCPServerLimits(
+        maxConcurrentConnections: 64,
+        readIdleTimeout: 15,
+        headerReadTimeout: 30
+    )
+
+    func validate() throws {
+        guard maxConcurrentConnections > 0 else {
+            throw MCPServerError.invalidArguments("maxConcurrentConnections must be positive")
+        }
+        guard readIdleTimeout > 0 else {
+            throw MCPServerError.invalidArguments("readIdleTimeout must be positive")
+        }
+        guard headerReadTimeout > 0 else {
+            throw MCPServerError.invalidArguments("headerReadTimeout must be positive")
+        }
+    }
+}
+
+private final class MCPConnectionLease {
+    let connection: NWConnection
+    private let slot: DispatchSemaphore
+    private let onFinish: () -> Void
+    private let lock = NSLock()
+    private var finished = false
+
+    init(connection: NWConnection, slot: DispatchSemaphore, onFinish: @escaping () -> Void) {
+        self.connection = connection
+        self.slot = slot
+        self.onFinish = onFinish
+    }
+
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return finished
+    }
+
+    func finish() {
+        lock.lock()
+        let shouldFinish = !finished
+        if shouldFinish { finished = true }
+        lock.unlock()
+        guard shouldFinish else { return }
+        connection.cancel()
+        onFinish()
+        slot.signal()
+    }
+}
+
 final class LocalMCPServer {
     private let port: UInt16
     private let localAuthToken: String
     private let tools: LocalTools
     private let skills: CodexSkillRegistry
+    private let chatCorrelation = LogicalChatCorrelationService()
     private let log: (String) -> Void
     private let listenerQueue = DispatchQueue(label: "com.filemcp.http-listener", qos: .userInitiated)
     private let workQueue = DispatchQueue(label: "com.filemcp.http-workers", qos: .userInitiated, attributes: .concurrent)
+    private let limits: LocalMCPServerLimits
+    private let connectionSlots: DispatchSemaphore
     private var listener: NWListener?
     private let stateLock = NSLock()
+    private var activeConnections: [ObjectIdentifier: MCPConnectionLease] = [:]
     private var ready = false
 
     init(
@@ -1531,14 +1590,18 @@ final class LocalMCPServer {
         gitUserEmail: String,
         enableCommands: Bool,
         localAuthToken: String,
-        log: @escaping (String) -> Void
+        log: @escaping (String) -> Void,
+        limits: LocalMCPServerLimits = .standard
     ) throws {
         guard localAuthToken.utf8.count >= 32 else {
             throw MCPServerError.invalidArguments("Local MCP authentication token is too short")
         }
+        try limits.validate()
         self.port = port
         self.localAuthToken = localAuthToken
         self.log = log
+        self.limits = limits
+        self.connectionSlots = DispatchSemaphore(value: limits.maxConcurrentConnections)
         let resolver = try SafePathResolver(rootPath: allowedDirectory)
         self.tools = LocalTools(
             resolver: resolver,
@@ -1603,31 +1666,83 @@ final class LocalMCPServer {
         listener = nil
         stateLock.lock()
         ready = false
+        let leases = Array(activeConnections.values)
+        activeConnections.removeAll()
         stateLock.unlock()
+        for lease in leases { lease.finish() }
     }
 
     private func handle(_ connection: NWConnection) {
+        guard connectionSlots.wait(timeout: .now()) == .success else {
+            connection.cancel()
+            return
+        }
+
+        let connectionID = ObjectIdentifier(connection)
+        let lease = MCPConnectionLease(
+            connection: connection,
+            slot: connectionSlots,
+            onFinish: { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                self.activeConnections.removeValue(forKey: connectionID)
+                self.stateLock.unlock()
+            }
+        )
+        stateLock.lock()
+        activeConnections[connectionID] = lease
+        stateLock.unlock()
+
         connection.start(queue: listenerQueue)
-        receiveRequest(on: connection, accumulated: Data())
+        receiveRequest(
+            lease: lease,
+            accumulated: Data(),
+            headerDeadline: Date().addingTimeInterval(limits.headerReadTimeout)
+        )
     }
 
-    private func receiveRequest(on connection: NWConnection, accumulated: Data) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
+    private func receiveRequest(lease: MCPConnectionLease, accumulated: Data, headerDeadline: Date) {
+        guard !lease.isFinished else { return }
+
+        let separator = Data("\r\n\r\n".utf8)
+        let headerComplete = accumulated.range(of: separator) != nil
+        let now = Date()
+        let idleDeadline = now.addingTimeInterval(limits.readIdleTimeout)
+        let effectiveDeadline = headerComplete ? idleDeadline : min(idleDeadline, headerDeadline)
+        let remaining = effectiveDeadline.timeIntervalSince(now)
+        if remaining <= 0 {
+            lease.finish()
+            return
+        }
+
+        let timeoutItem = DispatchWorkItem { [weak lease] in
+            lease?.finish()
+        }
+        listenerQueue.asyncAfter(deadline: .now() + remaining, execute: timeoutItem)
+
+        lease.connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self, weak lease] data, _, isComplete, error in
+            timeoutItem.cancel()
+            guard let lease, !lease.isFinished else { return }
+            guard let self else {
+                lease.finish()
+                return
+            }
+
             var buffer = accumulated
             if let data { buffer.append(data) }
 
             switch self.parseHTTPRequest(buffer) {
             case let .request(request):
                 self.workQueue.async {
+                    guard !lease.isFinished else { return }
                     let response = self.process(request)
-                    self.send(response, on: connection)
+                    self.send(response, lease: lease)
                 }
                 return
             case let .failure(status, message):
                 self.send(
                     self.httpResponse(status: status, body: Data(message.utf8), contentType: "text/plain"),
-                    on: connection
+                    lease: lease
                 )
                 return
             case .incomplete:
@@ -1635,15 +1750,18 @@ final class LocalMCPServer {
             }
 
             if buffer.count > maxHTTPRequestHeaderBytes + maxHTTPRequestBodyBytes {
-                self.send(self.httpResponse(status: 413, body: Data("Payload too large".utf8), contentType: "text/plain"), on: connection)
+                self.send(
+                    self.httpResponse(status: 413, body: Data("Payload too large".utf8), contentType: "text/plain"),
+                    lease: lease
+                )
                 return
             }
 
             if isComplete || error != nil {
-                connection.cancel()
+                lease.finish()
                 return
             }
-            self.receiveRequest(on: connection, accumulated: buffer)
+            self.receiveRequest(lease: lease, accumulated: buffer, headerDeadline: headerDeadline)
         }
     }
 
@@ -1858,7 +1976,57 @@ final class LocalMCPServer {
     }
 
     private func allToolDefinitions() -> [[String: Any]] {
-        tools.toolDefinitions + skills.toolDefinitions
+        var result = tools.toolDefinitions.map(withCorrelationFacadeMetadata)
+        result.append(contentsOf: skills.toolDefinitions.map(withCorrelationFacadeMetadata))
+        result.append(observabilityConnectToolDefinition())
+        return result
+    }
+
+    private func withCorrelationFacadeMetadata(_ source: [String: Any]) -> [String: Any] {
+        var tool = source
+        guard var inputSchema = tool["inputSchema"] as? [String: Any],
+              var properties = inputSchema["properties"] as? [String: Any] else {
+            return tool
+        }
+        properties["_filemcp_chat"] = [
+            "type": "string",
+            "description": "Optional opaque FileMCP correlation handle returned by filemcp_observability_connect. It is observability metadata only and grants no additional authority.",
+        ]
+        inputSchema["properties"] = properties
+        tool["inputSchema"] = inputSchema
+        return tool
+    }
+
+    private func observabilityConnectToolDefinition() -> [String: Any] {
+        [
+            "name": "filemcp_observability_connect",
+            "description": "Establish or resume an opaque FileMCP logical-chat correlation handle for local observability. This handle is metadata only and never grants file, Git, or command permissions.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "chat_instance_id": [
+                        "type": "string",
+                        "description": "Optional prior FileMCP chat correlation handle to resume within this FileMCP process.",
+                    ],
+                ],
+                "required": [],
+                "additionalProperties": false,
+            ] as [String: Any],
+            "outputSchema": [
+                "type": "object",
+                "properties": [
+                    "chat_instance_id": ["type": "string"],
+                    "resumed": ["type": "boolean"],
+                ],
+                "required": ["chat_instance_id", "resumed"],
+                "additionalProperties": false,
+            ] as [String: Any],
+            "annotations": [
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "openWorldHint": false,
+            ],
+        ]
     }
 
     private func processLegacyRequest(id: Any, method: String, params: [String: Any]) -> Data {
@@ -1890,7 +2058,7 @@ final class LocalMCPServer {
             var result = modernCompleteResult([
                 "supportedVersions": [mcpModernProtocolVersion],
                 "capabilities": serverCapabilities(),
-                "instructions": "Read and manage files, Git repositories, Codex project skills, and optionally local commands inside the configured shared directory. When a user message begins with '/<skill-name>', call load_codex_skill with that exact name before answering and follow the returned SKILL.md instructions.",
+                "instructions": "Read and manage files, Git repositories, Codex project skills, and optionally local commands inside the configured shared directory. When a user message begins with '/<skill-name>', call load_codex_skill with that exact name before answering and follow the returned SKILL.md instructions. For local observability, call filemcp_observability_connect once for this chat context, then include the returned chat_instance_id as _filemcp_chat on later FileMCP tool calls. The handle is correlation metadata only and grants no additional authority.",
             ])
             addCacheMetadata(to: &result, ttlMs: 60_000)
             return jsonRPCResult(id: id, result: result)
@@ -1921,10 +2089,13 @@ final class LocalMCPServer {
                 status: modern ? 400 : 200
             )
         }
-        guard tools.hasTool(named: toolName) || skills.hasTool(named: toolName) else {
+
+        let isObservabilityConnect = toolName == "filemcp_observability_connect"
+        guard tools.hasTool(named: toolName) || skills.hasTool(named: toolName) || isObservabilityConnect else {
             return jsonRPCError(id: id, code: -32602, message: "Unknown tool: \(toolName)")
         }
-        let arguments: [String: Any]
+
+        var arguments: [String: Any]
         if let rawArguments = params["arguments"] {
             guard let typedArguments = rawArguments as? [String: Any] else {
                 var result: [String: Any] = [
@@ -1938,7 +2109,43 @@ final class LocalMCPServer {
         } else {
             arguments = [:]
         }
+
         do {
+            if isObservabilityConnect {
+                for key in arguments.keys where key != "chat_instance_id" {
+                    throw MCPServerError.invalidArguments("Unknown argument: \(key)")
+                }
+
+                let requested: String?
+                if let rawRequested = arguments["chat_instance_id"] {
+                    guard let typedRequested = rawRequested as? String else {
+                        throw MCPServerError.invalidArguments("Argument chat_instance_id must be a string")
+                    }
+                    requested = typedRequested
+                } else {
+                    requested = nil
+                }
+
+                let connection = try chatCorrelation.connect(chatInstanceID: requested)
+                let structuredContent: [String: Any] = [
+                    "chat_instance_id": connection.chatInstanceID,
+                    "resumed": connection.resumed,
+                ]
+                let textData = try JSONSerialization.data(withJSONObject: structuredContent, options: [.sortedKeys])
+                let text = String(data: textData, encoding: .utf8) ?? "{}"
+                var result: [String: Any] = [
+                    "content": [["type": "text", "text": text]],
+                    "structuredContent": structuredContent,
+                    "isError": false,
+                ]
+                if modern { result = modernCompleteResult(result) }
+                return jsonRPCResult(id: id, result: result)
+            }
+
+            let correlationValue = arguments.removeValue(forKey: "_filemcp_chat")
+            let correlationHandle = correlationValue as? String
+            _ = chatCorrelation.tryResolve(correlationHandle)
+
             let content: [[String: Any]]
             let structuredContent: [String: Any]
             if skills.hasTool(named: toolName) {
@@ -2191,9 +2398,10 @@ final class LocalMCPServer {
         return response
     }
 
-    private func send(_ data: Data, on connection: NWConnection) {
-        connection.send(content: data, completion: .contentProcessed { _ in
-            connection.cancel()
+    private func send(_ data: Data, lease: MCPConnectionLease) {
+        guard !lease.isFinished else { return }
+        lease.connection.send(content: data, completion: .contentProcessed { _ in
+            lease.finish()
         })
     }
 }

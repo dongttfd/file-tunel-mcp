@@ -12,3 +12,8 @@ dist/
 
 # macOS
 .DS_Store
+
+# Production signing key material must never be committed.
+*.pfx
+*.p12
+*.p8

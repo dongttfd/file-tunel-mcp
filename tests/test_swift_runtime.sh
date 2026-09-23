@@ -160,7 +160,184 @@ SWIFT
 swiftc -o "$TMP_DIR/process-test" \
     macos/ProcessRunner.swift \
     "$TMP_DIR/main.swift"
+
 "$TMP_DIR/process-test"
+
+cat >"$TMP_DIR/main.swift" <<'SWIFT'
+import Foundation
+
+var now = Date(timeIntervalSince1970: 1_000)
+var randomSeed: UInt8 = 1
+let service = LogicalChatCorrelationService(
+    maxKnownHandles: 4,
+    retention: 60,
+    nowProvider: { now },
+    randomBytesProvider: { count in
+        let value = randomSeed
+        randomSeed &+= 1
+        return [UInt8](repeating: value, count: count)
+    }
+)
+
+let first = try service.connect()
+precondition(!first.resumed, "new correlation handle must not be resumed")
+precondition(LogicalChatCorrelationService.isValidHandle(first.chatInstanceID), "generated handle format")
+precondition(first.chatInstanceID.hasPrefix("chat_"), "generated handle prefix")
+precondition(first.chatInstanceID.count == 48, "generated handle total length")
+
+let firstHash = service.tryResolve(first.chatInstanceID)
+precondition(firstHash?.count == 64, "known handle resolves to SHA-256 hash")
+let persistedHash = try LogicalChatCorrelationService.hashForPersistence(first.chatInstanceID)
+precondition(persistedHash == firstHash, "persistence hash parity")
+
+let resumed = try service.connect(chatInstanceID: first.chatInstanceID)
+precondition(resumed.resumed && resumed.chatInstanceID == first.chatInstanceID, "known handle resumes")
+
+do {
+    _ = try service.connect(chatInstanceID: "bad")
+    preconditionFailure("malformed handle must be rejected")
+} catch {
+    precondition(error.localizedDescription.contains("Invalid FileMCP chat correlation handle"), "unexpected malformed-handle error")
+}
+
+let unknown = "chat_" + String(repeating: "A", count: 43)
+precondition(LogicalChatCorrelationService.isValidHandle(unknown), "unknown test handle must be syntactically valid")
+do {
+    _ = try service.connect(chatInstanceID: unknown)
+    preconditionFailure("unknown valid handle must be rejected")
+} catch {
+    precondition(error.localizedDescription.contains("Unknown FileMCP chat correlation handle"), "unexpected unknown-handle error")
+}
+
+now = now.addingTimeInterval(61)
+precondition(service.tryResolve(first.chatInstanceID) == nil, "expired handle must not resolve")
+let expiredSnapshot = service.retentionSnapshot()
+precondition(expiredSnapshot.knownHandles == 0, "expired handle must be removed")
+precondition(expiredSnapshot.expiredEvictions >= 1, "expiry counter must advance")
+
+var pressureNow = Date(timeIntervalSince1970: 2_000)
+var pressureSeed: UInt8 = 20
+let pressure = LogicalChatCorrelationService(
+    maxKnownHandles: 2,
+    retention: 3_600,
+    nowProvider: { pressureNow },
+    randomBytesProvider: { count in
+        let value = pressureSeed
+        pressureSeed &+= 1
+        return [UInt8](repeating: value, count: count)
+    }
+)
+let p1 = try pressure.connect()
+pressureNow = pressureNow.addingTimeInterval(1)
+let p2 = try pressure.connect()
+pressureNow = pressureNow.addingTimeInterval(1)
+_ = try pressure.connect()
+let pressureSnapshot = pressure.retentionSnapshot()
+precondition(pressureSnapshot.knownHandles == 2, "pressure registry must remain bounded")
+precondition(pressureSnapshot.capacityPressureEvents >= 1, "pressure event counter must advance")
+precondition(pressureSnapshot.pressureEvictions >= 1, "pressure eviction counter must advance")
+precondition(pressure.tryResolve(p1.chatInstanceID) == nil, "oldest handle must be pressure-evicted")
+precondition(pressure.tryResolve(p2.chatInstanceID) != nil, "newer handle must remain")
+
+print("logical-chat-correlation: ok")
+SWIFT
+
+swiftc -framework Security -o "$TMP_DIR/correlation-test" \
+    macos/LogicalChatCorrelation.swift \
+    "$TMP_DIR/main.swift"
+"$TMP_DIR/correlation-test"
+
+cat >"$TMP_DIR/main.swift" <<'SWIFT'
+import Foundation
+
+func approx(_ lhs: TimeInterval, _ rhs: TimeInterval, tolerance: TimeInterval = 0.0001) -> Bool {
+    abs(lhs - rhs) <= tolerance
+}
+
+let base = Date(timeIntervalSince1970: 10_000)
+let options = TunnelSupervisorOptions(
+    initialBackoff: 1,
+    maxBackoff: 4,
+    restartWindow: 10,
+    maxRestartsInWindow: 3,
+    stableRunReset: 5,
+    jitterRatio: 0.20
+)
+let policy = TunnelRestartPolicy(options: options)
+let first = policy.next(processStarted: base, now: base, random: { 0.5 })
+precondition(!first.isCooldown && first.attemptNumber == 1 && approx(first.delay, 1), "first backoff")
+let second = policy.next(processStarted: base, now: base.addingTimeInterval(1), random: { 0.5 })
+precondition(!second.isCooldown && second.attemptNumber == 2 && approx(second.delay, 2), "second backoff")
+let third = policy.next(processStarted: base, now: base.addingTimeInterval(2), random: { 0.5 })
+precondition(!third.isCooldown && third.attemptNumber == 3 && approx(third.delay, 4), "third backoff")
+let cooldown = policy.next(processStarted: base, now: base.addingTimeInterval(3), random: { 0.5 })
+precondition(cooldown.isCooldown, "restart budget must enter cooldown")
+precondition(approx(cooldown.delay, 7), "cooldown delay must reach oldest-attempt window expiry")
+precondition(cooldown.resumeAt == base.addingTimeInterval(10), "cooldown resume time")
+
+let jitterOptions = TunnelSupervisorOptions(
+    initialBackoff: 10,
+    maxBackoff: 30,
+    restartWindow: 100,
+    maxRestartsInWindow: 10,
+    stableRunReset: 50,
+    jitterRatio: 0.20
+)
+let lowJitter = TunnelRestartPolicy(options: jitterOptions)
+precondition(approx(lowJitter.next(processStarted: base, now: base, random: { 0 }).delay, 8), "low jitter bound")
+let highJitter = TunnelRestartPolicy(options: jitterOptions)
+precondition(approx(highJitter.next(processStarted: base, now: base, random: { 1 }).delay, 12), "high jitter bound")
+
+let clampOptions = TunnelSupervisorOptions(
+    initialBackoff: 1,
+    maxBackoff: 4,
+    restartWindow: 100,
+    maxRestartsInWindow: 20,
+    stableRunReset: 50,
+    jitterRatio: 0
+)
+let clamp = TunnelRestartPolicy(options: clampOptions)
+_ = clamp.next(processStarted: base, now: base, random: { 0.5 })
+_ = clamp.next(processStarted: base, now: base.addingTimeInterval(1), random: { 0.5 })
+_ = clamp.next(processStarted: base, now: base.addingTimeInterval(2), random: { 0.5 })
+let clamped = clamp.next(processStarted: base, now: base.addingTimeInterval(3), random: { 0.5 })
+precondition(approx(clamped.delay, 4), "max backoff clamp")
+
+let stable = TunnelRestartPolicy(options: options)
+_ = stable.next(processStarted: base, now: base, random: { 0.5 })
+_ = stable.next(processStarted: base, now: base.addingTimeInterval(1), random: { 0.5 })
+let afterStableRun = stable.next(processStarted: base, now: base.addingTimeInterval(6), random: { 0.5 })
+precondition(afterStableRun.attemptNumber == 1 && approx(afterStableRun.delay, 1), "stable run must reset history")
+stable.reset()
+precondition(stable.consecutiveRestarts == 0 && stable.attemptsInWindow == 0, "explicit reset")
+
+let stressOptions = TunnelSupervisorOptions(
+    initialBackoff: 0.001,
+    maxBackoff: 0.01,
+    restartWindow: 1,
+    maxRestartsInWindow: 5,
+    stableRunReset: 10_000,
+    jitterRatio: 0.20
+)
+let stress = TunnelRestartPolicy(options: stressOptions)
+var stressNow = base
+for _ in 0..<10_000 {
+    let decision = stress.next(processStarted: stressNow, now: stressNow, random: { 0.5 })
+    precondition(stress.attemptsInWindow <= 5, "restart window state must stay bounded")
+    if decision.isCooldown {
+        stressNow = decision.resumeAt ?? stressNow.addingTimeInterval(decision.delay)
+        stress.reset()
+    } else {
+        stressNow = stressNow.addingTimeInterval(0.0001)
+    }
+}
+print("tunnel-supervisor-policy: ok")
+SWIFT
+
+swiftc -o "$TMP_DIR/supervisor-test" \
+    macos/TunnelSupervisor.swift \
+    "$TMP_DIR/main.swift"
+"$TMP_DIR/supervisor-test"
 
 cat >"$TMP_DIR/tunnel-client" <<'SH'
 #!/bin/sh
@@ -202,7 +379,21 @@ case "$1" in
         exit 0
         ;;
     doctor) echo "doctor-ok ${CONTROL_PLANE_API_KEY:-} ${FILEMCP_LOCAL_AUTH_TOKEN:-}"; exit 0 ;;
-    run) echo "run-ok ${CONTROL_PLANE_API_KEY:-} ${FILEMCP_LOCAL_AUTH_TOKEN:-}"; trap 'exit 0' TERM INT; while :; do sleep 1; done ;;
+    run)
+        if [ -n "${MCP_TEST_RUN_COUNT_FILE:-}" ]; then printf 'run\n' >> "$MCP_TEST_RUN_COUNT_FILE"; fi
+        if [ -n "${MCP_TEST_RUN_EXIT_ONCE_MARKER:-}" ] && [ ! -e "$MCP_TEST_RUN_EXIT_ONCE_MARKER" ]; then
+            : > "$MCP_TEST_RUN_EXIT_ONCE_MARKER"
+            echo "run-crash-once"
+            exit "${MCP_TEST_RUN_EXIT_CODE:-17}"
+        fi
+        if [ "${MCP_TEST_RUN_ALWAYS_EXIT:-0}" = "1" ]; then
+            echo "run-crash"
+            exit "${MCP_TEST_RUN_EXIT_CODE:-17}"
+        fi
+        echo "run-ok ${CONTROL_PLANE_API_KEY:-} ${FILEMCP_LOCAL_AUTH_TOKEN:-}"
+        trap 'exit 0' TERM INT
+        while :; do sleep 1; done
+        ;;
     *) echo unsupported-subcommand >&2; exit 2 ;;
 esac
 SH
@@ -287,6 +478,160 @@ first.shutdownImmediately()
 waitFor({ first.state == .stopped }, timeout: 5, label: "shutdown")
 print("runtime-lifecycle-profile-lock: ok")
 
+func runLaunchCount(_ url: URL) -> Int {
+    guard let text = try? String(contentsOf: url, encoding: .utf8) else { return 0 }
+    return text.split(whereSeparator: { $0.isNewline }).count
+}
+
+let supervisorOptions = TunnelSupervisorOptions(
+    initialBackoff: 0.8,
+    maxBackoff: 0.8,
+    restartWindow: 5,
+    maxRestartsInWindow: 3,
+    stableRunReset: 3,
+    jitterRatio: 0
+)
+
+let crashOnceMarker = root.appendingPathComponent("crash-once.marker")
+let restartCountFile = root.appendingPathComponent("restart-count.txt")
+setenv("MCP_TEST_RUN_EXIT_ONCE_MARKER", crashOnceMarker.path, 1)
+setenv("MCP_TEST_RUN_COUNT_FILE", restartCountFile.path, 1)
+setenv("MCP_TEST_RUN_EXIT_CODE", "17", 1)
+let restartProfile = "restart-runtime-\(UUID().uuidString)"
+let restartRuntime = LocalMCPRuntime(
+    profileDirectory: profileDirectory,
+    supervisorOptions: supervisorOptions,
+    jitterProvider: { 0.5 }
+)
+let restartLogLock = NSLock()
+var restartLog = ""
+restartRuntime.onLog = { text in
+    restartLogLock.lock()
+    restartLog += text
+    restartLogLock.unlock()
+}
+let restartConfig = LocalMCPConfiguration(
+    tunnelID: "tunnel_0123456789abcdef0123456789abcdef", apiKey: "test-key", profile: restartProfile, port: 18082,
+    allowedDirectory: root.path, healthAddress: "127.0.0.1:0",
+    gitUserName: "", gitUserEmail: "", enableCommands: false
+)
+restartRuntime.start(restartConfig)
+waitFor({ FileManager.default.fileExists(atPath: crashOnceMarker.path) }, timeout: 5, label: "first tunnel crash")
+waitFor({
+    if case .restarting = restartRuntime.state { return true }
+    return false
+}, timeout: 5, label: "restart pending")
+
+let lockContender = LocalMCPRuntime(profileDirectory: profileDirectory)
+let contenderConfig = LocalMCPConfiguration(
+    tunnelID: restartConfig.tunnelID, apiKey: restartConfig.apiKey, profile: restartProfile, port: 18081,
+    allowedDirectory: root.path, healthAddress: "127.0.0.1:0",
+    gitUserName: "", gitUserEmail: "", enableCommands: false
+)
+lockContender.start(contenderConfig)
+waitFor({ isFailed(lockContender.state) }, timeout: 3, label: "profile lock retained during restart")
+lockContender.shutdownImmediately()
+
+waitFor({ restartRuntime.state == .running && runLaunchCount(restartCountFile) >= 2 }, timeout: 5, label: "automatic tunnel restart")
+restartLogLock.lock()
+let restartLogSnapshot = restartLog
+restartLogLock.unlock()
+precondition(restartLogSnapshot.contains("Tunnel restart succeeded."), "runtime did not report successful restart")
+precondition(runLaunchCount(restartCountFile) == 2, "crash-once runtime should launch tunnel exactly twice")
+unsetenv("MCP_TEST_RUN_EXIT_ONCE_MARKER")
+unsetenv("MCP_TEST_RUN_COUNT_FILE")
+unsetenv("MCP_TEST_RUN_EXIT_CODE")
+restartRuntime.stop()
+waitFor({ restartRuntime.state == .stopped }, timeout: 5, label: "restarted runtime stop")
+print("runtime-tunnel-auto-restart: ok")
+
+let cancelCountFile = root.appendingPathComponent("cancel-restart-count.txt")
+setenv("MCP_TEST_RUN_ALWAYS_EXIT", "1", 1)
+setenv("MCP_TEST_RUN_COUNT_FILE", cancelCountFile.path, 1)
+setenv("MCP_TEST_RUN_EXIT_CODE", "19", 1)
+let cancelRuntime = LocalMCPRuntime(
+    profileDirectory: profileDirectory,
+    supervisorOptions: supervisorOptions,
+    jitterProvider: { 0.5 }
+)
+let cancelConfig = LocalMCPConfiguration(
+    tunnelID: "tunnel_0123456789abcdef0123456789abcdef", apiKey: "test-key", profile: "cancel-runtime-\(UUID().uuidString)", port: 18080,
+    allowedDirectory: root.path, healthAddress: "127.0.0.1:0",
+    gitUserName: "", gitUserEmail: "", enableCommands: false
+)
+cancelRuntime.start(cancelConfig)
+waitFor({ runLaunchCount(cancelCountFile) >= 1 }, timeout: 5, label: "cancel test first launch")
+waitFor({
+    if case .restarting = cancelRuntime.state { return true }
+    return false
+}, timeout: 5, label: "cancel test restart pending")
+cancelRuntime.stop()
+waitFor({ cancelRuntime.state == .stopped }, timeout: 5, label: "cancel test stopped")
+let launchCountAtStop = runLaunchCount(cancelCountFile)
+Thread.sleep(forTimeInterval: 1.2)
+precondition(runLaunchCount(cancelCountFile) == launchCountAtStop, "tunnel relaunched after user stop canceled pending restart")
+unsetenv("MCP_TEST_RUN_ALWAYS_EXIT")
+unsetenv("MCP_TEST_RUN_COUNT_FILE")
+unsetenv("MCP_TEST_RUN_EXIT_CODE")
+print("runtime-tunnel-restart-cancel: ok")
+
+let cooldownCountFile = root.appendingPathComponent("cooldown-restart-count.txt")
+setenv("MCP_TEST_RUN_ALWAYS_EXIT", "1", 1)
+setenv("MCP_TEST_RUN_COUNT_FILE", cooldownCountFile.path, 1)
+setenv("MCP_TEST_RUN_EXIT_CODE", "23", 1)
+let cooldownOptions = TunnelSupervisorOptions(
+    initialBackoff: 0.05,
+    maxBackoff: 0.05,
+    restartWindow: 30,
+    maxRestartsInWindow: 1,
+    stableRunReset: 60,
+    jitterRatio: 0
+)
+let cooldownRuntime = LocalMCPRuntime(
+    profileDirectory: profileDirectory,
+    supervisorOptions: cooldownOptions,
+    jitterProvider: { 0.5 }
+)
+let cooldownLogLock = NSLock()
+var cooldownLog = ""
+cooldownRuntime.onLog = { text in
+    cooldownLogLock.lock()
+    cooldownLog += text
+    cooldownLogLock.unlock()
+}
+let cooldownConfig = LocalMCPConfiguration(
+    tunnelID: "tunnel_0123456789abcdef0123456789abcdef", apiKey: "test-key",
+    profile: "cooldown-runtime-test", port: 18079,
+    allowedDirectory: root.path, healthAddress: "127.0.0.1:0",
+    gitUserName: "", gitUserEmail: "", enableCommands: false
+)
+cooldownRuntime.start(cooldownConfig)
+let cooldownDeadline = Date().addingTimeInterval(8)
+var observedCooldown = false
+while Date() < cooldownDeadline {
+    if case .cooldown = cooldownRuntime.state {
+        observedCooldown = true
+        break
+    }
+    Thread.sleep(forTimeInterval: 0.05)
+}
+if !observedCooldown {
+    cooldownLogLock.lock()
+    let cooldownLogSnapshot = cooldownLog
+    cooldownLogLock.unlock()
+    fatalError("timed out waiting for restart budget cooldown; state=\(cooldownRuntime.state); launches=\(runLaunchCount(cooldownCountFile)); log=\(cooldownLogSnapshot)")
+}
+precondition(runLaunchCount(cooldownCountFile) == 2, "cooldown should occur after initial launch plus one bounded restart attempt")
+cooldownRuntime.stop()
+waitFor({ cooldownRuntime.state == .stopped }, timeout: 5, label: "cooldown stop")
+let cooldownLaunchCountAtStop = runLaunchCount(cooldownCountFile)
+Thread.sleep(forTimeInterval: 0.3)
+precondition(runLaunchCount(cooldownCountFile) == cooldownLaunchCountAtStop, "cooldown stop must cancel pending recovery")
+unsetenv("MCP_TEST_RUN_ALWAYS_EXIT")
+unsetenv("MCP_TEST_RUN_COUNT_FILE")
+unsetenv("MCP_TEST_RUN_EXIT_CODE")
+print("runtime-tunnel-restart-cooldown: ok")
+
 let invalidHealthRuntime = LocalMCPRuntime(profileDirectory: profileDirectory)
 let invalidHealthConfig = LocalMCPConfiguration(
     tunnelID: "tunnel_0123456789abcdef0123456789abcdef", apiKey: "test-key", profile: "invalid-health-\(UUID().uuidString)", port: 18083,
@@ -362,7 +707,9 @@ SWIFT
 
 swiftc -framework Network -framework Security -o "$TMP_DIR/runtime-test" \
     macos/ProcessRunner.swift \
+    macos/LogicalChatCorrelation.swift \
     macos/LocalMCPServer.swift \
+    macos/TunnelSupervisor.swift \
     macos/LocalMCPRuntime.swift \
     "$TMP_DIR/main.swift"
 "$TMP_DIR/runtime-test"
@@ -476,8 +823,23 @@ let server = try LocalMCPServer(
     localAuthToken: localAuthToken,
     log: { _ in }
 )
+let boundedServer = try LocalMCPServer(
+    port: 18090,
+    allowedDirectory: root.path,
+    gitUserName: "Test User",
+    gitUserEmail: "test@example.com",
+    enableCommands: false,
+    localAuthToken: localAuthToken,
+    log: { _ in },
+    limits: LocalMCPServerLimits(
+        maxConcurrentConnections: 2,
+        readIdleTimeout: 0.5,
+        headerReadTimeout: 1.0
+    )
+)
 try safeGitServer.start()
 try server.start()
+try boundedServer.start()
 // The shell harness owns this process lifetime and terminates it after all
 // transport tests. Do not use a wall-clock timer here: as the suite grows, a
 // fixed lifetime turns later parser/fuzz checks into false crash reports.
@@ -486,8 +848,9 @@ while true {
 }
 SWIFT
 
-swiftc -framework Network -o "$TMP_DIR/server-test" \
+swiftc -framework Network -framework Security -o "$TMP_DIR/server-test" \
     macos/ProcessRunner.swift \
+    macos/LogicalChatCorrelation.swift \
     macos/LocalMCPServer.swift \
     "$TMP_DIR/main.swift"
 mkdir -p "$TMP_DIR/git-template"
@@ -500,6 +863,91 @@ BASE_URL="http://127.0.0.1:18088/mcp"
 SAFE_BASE_URL="http://127.0.0.1:18089/mcp"
 SERVER_ROOT="${TMPDIR%/}/filemcp-server-test"
 LOCAL_AUTH_TOKEN="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
+python3 - <<'PY'
+import socket
+import time
+
+HOST = "127.0.0.1"
+PORT = 18090
+TOKEN = "a" * 64
+
+def connect():
+    sock = socket.create_connection((HOST, PORT), timeout=2)
+    sock.settimeout(2)
+    return sock
+
+def closed(sock, timeout=1.5):
+    sock.settimeout(timeout)
+    try:
+        return sock.recv(1) == b""
+    except (ConnectionResetError, BrokenPipeError, OSError):
+        return True
+    except socket.timeout:
+        return False
+
+first = connect()
+second = connect()
+first.sendall(b"G")
+second.sendall(b"G")
+time.sleep(0.10)
+
+excess = connect()
+if not closed(excess):
+    raise SystemExit("macOS connection cap did not reject excess client")
+excess.close()
+
+first.close()
+time.sleep(0.15)
+
+body = b'{"jsonrpc":"2.0","id":900,"method":"tools/list","params":{}}'
+request = (
+    f"POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\n"
+    "Content-Type: application/json\r\n"
+    f"X-FileMCP-Local-Token: {TOKEN}\r\n"
+    f"Content-Length: {len(body)}\r\n\r\n"
+).encode() + body
+valid = connect()
+valid.sendall(request)
+valid.shutdown(socket.SHUT_WR)
+response = b""
+while True:
+    chunk = valid.recv(8192)
+    if not chunk:
+        break
+    response += chunk
+valid.close()
+if b"HTTP/1.1 200 OK" not in response:
+    raise SystemExit("macOS connection slot was not reusable after release")
+second.close()
+time.sleep(0.10)
+
+idle = connect()
+time.sleep(0.80)
+if not closed(idle):
+    raise SystemExit("macOS idle connection did not time out")
+idle.close()
+
+trickle = connect()
+trickle_closed = False
+started = time.monotonic()
+for _ in range(20):
+    try:
+        trickle.sendall(b"G")
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        trickle_closed = True
+        break
+    time.sleep(0.10)
+    if time.monotonic() - started > 1.6:
+        break
+if not trickle_closed:
+    trickle_closed = closed(trickle, timeout=0.8)
+trickle.close()
+if not trickle_closed:
+    raise SystemExit("macOS absolute header deadline did not stop trickle client")
+
+print("macos-http-connection-bounds: ok")
+PY
 
 UNAUTHENTICATED="$(command curl -sS -i -X POST "$BASE_URL" \
     -H 'Content-Type: application/json' \
@@ -545,6 +993,41 @@ if printf '%s' "$SAFE_TOOLS" | grep -q '"name":"run_command"'; then
     echo "run_command must not be exposed while command execution is disabled" >&2
     exit 1
 fi
+
+printf '%s' "$SAFE_TOOLS" | grep -q '"name":"filemcp_observability_connect"'
+printf '%s' "$SAFE_TOOLS" | grep -q '"_filemcp_chat"'
+
+CHAT_CONNECT="$(curl -fsS -X POST "$BASE_URL" \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":391,"method":"tools/call","params":{"name":"filemcp_observability_connect","arguments":{}}}')"
+CHAT_HANDLE="$(printf '%s' "$CHAT_CONNECT" | plutil -extract result.structuredContent.chat_instance_id raw -expect string -o - -)"
+printf '%s' "$CHAT_HANDLE" | grep -Eq '^chat_[A-Za-z0-9_-]{43}$'
+printf '%s' "$CHAT_CONNECT" | plutil -extract result.structuredContent.resumed raw -expect bool -o - - | grep -qx 'false'
+
+CHAT_RESUME="$(curl -fsS -X POST "$BASE_URL" \
+    -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":392,\"method\":\"tools/call\",\"params\":{\"name\":\"filemcp_observability_connect\",\"arguments\":{\"chat_instance_id\":\"$CHAT_HANDLE\"}}}")"
+printf '%s' "$CHAT_RESUME" | plutil -extract result.structuredContent.resumed raw -expect bool -o - - | grep -qx 'true'
+
+CHAT_BAD_ARG="$(curl -fsS -X POST "$BASE_URL" \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","id":393,"method":"tools/call","params":{"name":"filemcp_observability_connect","arguments":{"unexpected":true}}}')"
+printf '%s' "$CHAT_BAD_ARG" | plutil -extract result.isError raw -expect bool -o - - | grep -qx 'true'
+printf '%s' "$CHAT_BAD_ARG" | grep -q 'Unknown argument'
+
+CORRELATED_READ="$(curl -fsS -X POST "$BASE_URL" \
+    -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":394,\"method\":\"tools/call\",\"params\":{\"name\":\"read_file\",\"arguments\":{\"relative_path\":\"hello.txt\",\"_filemcp_chat\":\"$CHAT_HANDLE\"}}}")"
+printf '%s' "$CORRELATED_READ" | plutil -extract result.isError raw -expect bool -o - - | grep -qx 'false'
+printf '%s' "$CORRELATED_READ" | plutil -extract result.structuredContent.result raw -expect string -o - - | grep -qx 'hello swift'
+
+UNKNOWN_CHAT_HANDLE="chat_$(printf 'A%.0s' {1..43})"
+UNBOUND_READ="$(curl -fsS -X POST "$BASE_URL" \
+    -H 'Content-Type: application/json' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":395,\"method\":\"tools/call\",\"params\":{\"name\":\"read_file\",\"arguments\":{\"relative_path\":\"hello.txt\",\"_filemcp_chat\":\"$UNKNOWN_CHAT_HANDLE\"}}}")"
+printf '%s' "$UNBOUND_READ" | plutil -extract result.isError raw -expect bool -o - - | grep -qx 'false'
+printf '%s' "$UNBOUND_READ" | plutil -extract result.structuredContent.result raw -expect string -o - - | grep -qx 'hello swift'
+echo "logical-chat-facade-legacy: ok"
 
 NEGATIVE_LENGTH="$(printf 'POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:18088\r\nContent-Type: application/json\r\nContent-Length: -1\r\n\r\n' | nc 127.0.0.1 18088)"
 printf '%s' "$NEGATIVE_LENGTH" | grep -q 'HTTP/1.1 400 Bad Request'
@@ -1259,6 +1742,20 @@ printf '%s' "$TOOLS" | grep -q '"name":"read_file"'
 printf '%s' "$TOOLS" | grep -q '"name":"read_file_range"'
 printf '%s' "$TOOLS" | grep -q '"name":"search_content"'
 printf '%s' "$TOOLS" | grep -q '"outputSchema"'
+printf '%s' "$TOOLS" | grep -q '"name":"filemcp_observability_connect"'
+printf '%s' "$TOOLS" | grep -q '"_filemcp_chat"'
+printf '%s' "$DISCOVER" | grep -q 'filemcp_observability_connect'
+printf '%s' "$DISCOVER" | grep -q '_filemcp_chat'
+
+MODERN_CHAT_RESUME="$(curl -fsS -X POST "$BASE_URL" \
+    -H 'Content-Type: application/json' \
+    -H 'MCP-Protocol-Version: 2026-07-28' \
+    -H 'Mcp-Method: tools/call' \
+    -H 'Mcp-Name: filemcp_observability_connect' \
+    -d "{\"jsonrpc\":\"2.0\",\"id\":111,\"method\":\"tools/call\",\"params\":{\"name\":\"filemcp_observability_connect\",\"arguments\":{\"chat_instance_id\":\"$CHAT_HANDLE\"},\"_meta\":$MODERN_META}}")"
+printf '%s' "$MODERN_CHAT_RESUME" | grep -q '"resultType":"complete"'
+printf '%s' "$MODERN_CHAT_RESUME" | plutil -extract result.structuredContent.resumed raw -expect bool -o - - | grep -qx 'true'
+echo "logical-chat-facade-modern: ok"
 printf '%s' "$TOOLS" | plutil -extract result.tools.0.outputSchema.properties.result.type raw -expect string -o - - | grep -qx 'array'
 printf '%s' "$TOOLS" | plutil -extract result.tools.1.outputSchema.properties.result.type raw -expect string -o - - | grep -qx 'string'
 printf '%s' "$TOOLS" | plutil -extract result.tools.2.outputSchema.properties.content.type raw -expect string -o - - | grep -qx 'string'
