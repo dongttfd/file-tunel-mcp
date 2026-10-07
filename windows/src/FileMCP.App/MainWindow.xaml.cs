@@ -68,6 +68,9 @@ public partial class MainWindow : Window
         GitNameBox.Text = settings.GitUserName;
         GitEmailBox.Text = settings.GitUserEmail;
         EnableCommandsCheckBox.IsChecked = settings.EnableCommands;
+        EnableCodexMcpCheckBox.IsChecked = settings.EnableCodexMcp;
+        CodexExecutableBox.Text = settings.CodexExecutable;
+        CodexMcpAllowlistBox.Text = string.Join(", ", settings.CodexMcpAllowlist);
     }
 
     private void UpdateApiKeyStatus()
@@ -102,7 +105,10 @@ public partial class MainWindow : Window
             var configuration = new LocalMcpConfiguration(
                 TunnelIdBox.Text.Trim(), apiKey, ProfileBox.Text.Trim(), checked((ushort)_settings.Port),
                 DirectoryBox.Text.Trim(), HealthAddressBox.Text.Trim(), GitNameBox.Text.Trim(), GitEmailBox.Text.Trim(),
-                EnableCommandsCheckBox.IsChecked == true);
+                EnableCommandsCheckBox.IsChecked == true,
+                EnableCodexMcpCheckBox.IsChecked == true,
+                CodexExecutableBox.Text.Trim(),
+                CodexMcpAllowlistBox.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
             await _runtime.StartAsync(configuration);
         }
         catch (Exception ex) { ShowError(ex.Message); }
@@ -199,6 +205,9 @@ public partial class MainWindow : Window
         _settings.GitUserName = GitNameBox.Text.Trim();
         _settings.GitUserEmail = GitEmailBox.Text.Trim();
         _settings.EnableCommands = EnableCommandsCheckBox.IsChecked == true;
+        _settings.EnableCodexMcp = EnableCodexMcpCheckBox.IsChecked == true;
+        _settings.CodexExecutable = CodexExecutableBox.Text.Trim();
+        _settings.CodexMcpAllowlist = CodexMcpAllowlistBox.Text.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
     }
 
     private void UpdateRuntimeState(LocalMcpRuntimeState state)

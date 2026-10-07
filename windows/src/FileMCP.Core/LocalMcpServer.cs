@@ -27,22 +27,24 @@ public sealed class LocalMcpServer : IAsyncDisposable
     private readonly string _localAuthToken;
     private readonly LocalTools _tools;
     private readonly CodexSkillRegistry _skills;
+    private readonly CodexMcpGateway _codexGateway;
     private readonly Action<string> _log;
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
     private Task? _acceptLoop;
 
-    public LocalMcpServer(ushort port, string allowedDirectory, string gitUserName, string gitUserEmail, bool enableCommands, string localAuthToken, Action<string> log)
+    public LocalMcpServer(ushort port, string allowedDirectory, string gitUserName, string gitUserEmail, bool enableCommands, string localAuthToken, Action<string> log, bool enableCodexMcp = false, string codexExecutable = "", string[]? codexMcpAllowlist = null)
     {
         if (Encoding.UTF8.GetByteCount(localAuthToken) < 32) throw new FileMcpException("Local MCP authentication token is too short");
         _port = port; _localAuthToken = localAuthToken; _log = log;
         _tools = new LocalTools(allowedDirectory, gitUserName, gitUserEmail, enableCommands);
         _skills = new CodexSkillRegistry(allowedDirectory, log);
+        _codexGateway = new CodexMcpGateway(enableCodexMcp, codexExecutable, codexMcpAllowlist ?? [], log);
     }
 
     public bool IsReady { get; private set; }
 
-    public Task StartAsync(CancellationToken cancellationToken = default)
+    public async Task StartAsync(CancellationToken cancellationToken = default)
     {
         if (_port == 0) throw new FileMcpException("Invalid port: 0");
         try
@@ -54,7 +56,8 @@ public sealed class LocalMcpServer : IAsyncDisposable
             _acceptLoop = AcceptLoopAsync(_cts.Token);
             _log($"[MCP] Server listening on http://127.0.0.1:{_port}/mcp\n");
             _skills.Refresh();
-            return Task.CompletedTask;
+            await _codexGateway.RefreshAsync(cancellationToken).ConfigureAwait(false);
+            return;
         }
         catch (SocketException ex)
         {
@@ -65,6 +68,7 @@ public sealed class LocalMcpServer : IAsyncDisposable
 
     public void Stop()
     {
+        _codexGateway.Dispose();
         IsReady = false;
         try { _cts?.Cancel(); } catch { }
         try { _listener?.Stop(); } catch { }
@@ -234,7 +238,7 @@ public sealed class LocalMcpServer : IAsyncDisposable
             {
                 ["supportedVersions"] = new JsonArray(FileMcpConstants.ModernProtocolVersion),
                 ["capabilities"] = ServerCapabilities(),
-                ["instructions"] = "Read and manage files, Git repositories, Codex project skills, and optionally local commands inside the configured shared directory. When a user message begins with '/<skill-name>', call load_codex_skill with that exact name before answering and follow the returned SKILL.md instructions.",
+                ["instructions"] = "Read and manage files, Git repositories, Codex project skills, allowlisted Codex MCP servers, and optionally local commands. Use list_codex_mcp_servers and list_codex_mcp_tools before call_codex_mcp_tool when downstream MCP discovery is needed. When a user message begins with '/<skill-name>', call load_codex_skill with that exact name before answering and follow the returned SKILL.md instructions.",
             });
             result["ttlMs"] = 60_000; result["cacheScope"] = "private"; return JsonRpcResult(id, result);
         }
@@ -249,22 +253,23 @@ public sealed class LocalMcpServer : IAsyncDisposable
         var result = new JsonArray();
         foreach (var tool in _tools.ToolDefinitions) result.Add(tool?.DeepClone());
         foreach (var tool in _skills.ToolDefinitions) result.Add(tool?.DeepClone());
+        foreach (var tool in _codexGateway.ToolDefinitions) result.Add(tool?.DeepClone());
         return result;
     }
 
     private async Task<byte[]> CallToolAsync(JsonNode? id, JsonObject parameters, bool modern, CancellationToken cancellationToken)
     {
         if (parameters["name"] is not JsonValue nameNode || !nameNode.TryGetValue<string>(out var name)) return JsonRpcError(id, -32602, "Missing tool name", status: modern ? 400 : 200);
-        if (!_tools.HasTool(name) && !_skills.HasTool(name)) return JsonRpcError(id, -32602, $"Unknown tool: {name}");
+        if (!_tools.HasTool(name) && !_skills.HasTool(name) && !_codexGateway.HasTool(name)) return JsonRpcError(id, -32602, $"Unknown tool: {name}");
         JsonObject arguments;
         if (parameters["arguments"] is null) arguments = new JsonObject();
         else if (parameters["arguments"] is JsonObject obj) arguments = obj;
         else { var invalid = new JsonObject { ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = "Invalid arguments: expected an object" }), ["isError"] = true }; if (modern) invalid = ModernComplete(invalid); return JsonRpcResult(id, invalid); }
         try
         {
-            var output = _skills.HasTool(name)
-                ? _skills.Call(name, arguments)
-                : await _tools.CallAsync(name, arguments, cancellationToken).ConfigureAwait(false);
+            var output = _codexGateway.HasTool(name)
+                ? await _codexGateway.CallAsync(name, arguments, cancellationToken).ConfigureAwait(false)
+                : _skills.HasTool(name) ? _skills.Call(name, arguments) : await _tools.CallAsync(name, arguments, cancellationToken).ConfigureAwait(false);
             var result = new JsonObject { ["content"] = output.Content, ["structuredContent"] = output.StructuredContent, ["isError"] = false };
             if (modern) result = ModernComplete(result); return JsonRpcResult(id, result);
         }

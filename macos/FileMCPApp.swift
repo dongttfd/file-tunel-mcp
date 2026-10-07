@@ -6,7 +6,7 @@ private let appName = "FileMCP"
 private enum Layout {
     static let windowWidth: CGFloat = 440
     static let collapsedWindowHeight: CGFloat = 350
-    static let expandedWindowHeight: CGFloat = 450
+    static let expandedWindowHeight: CGFloat = 540
     static let footerHeight: CGFloat = 52
     static let contentWidth: CGFloat = 392
     static let labelWidth: CGFloat = 108
@@ -26,6 +26,9 @@ private enum ConfigKey {
     static let gitUserEmail = "gitUserEmail"
     static let apiKey = "apiKey"
     static let enableCommands = "enableCommands"
+    static let enableCodexMCP = "enableCodexMCP"
+    static let codexExecutable = "codexExecutable"
+    static let codexMCPAllowlist = "codexMCPAllowlist"
 }
 
 private final class LoadingButton: NSButton {
@@ -198,6 +201,9 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
     private let gitUserNameField = NSTextField()
     private let gitUserEmailField = NSTextField()
     private let enableCommandsCheckbox = NSButton(checkboxWithTitle: "Allow shell commands", target: nil, action: nil)
+    private let enableCodexMCPCheckbox = NSButton(checkboxWithTitle: "Enable Codex MCP federation", target: nil, action: nil)
+    private let codexExecutableField = NSTextField()
+    private let codexMCPAllowlistField = NSTextField()
     private let logView = NSTextView()
     private let saveConnectionButton = LoadingButton(title: "Save connection", target: nil, action: nil)
     private let saveSettingsButton = LoadingButton(title: "Save settings", target: nil, action: nil)
@@ -231,6 +237,8 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
         healthAddressField.toolTip = "Loopback-only tunnel-client health/admin listener. Use port 0 for an ephemeral port."
         configure(gitUserNameField, placeholder: "Git name for commits (optional)")
         configure(gitUserEmailField, placeholder: "Git email for commits (optional)")
+        configure(codexExecutableField, placeholder: "/opt/homebrew/bin/codex")
+        configure(codexMCPAllowlistField, placeholder: "context7, playwright")
 
         let chooseImage = NSImage(systemSymbolName: "folder", accessibilityDescription: "Choose directory")!
         let chooseButton = NSButton(image: chooseImage, target: self, action: #selector(chooseDirectory))
@@ -241,8 +249,8 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
         logView.isEditable = false
         logView.isSelectable = true
         logView.isVerticallyResizable = true
-        logView.isHorizontallyResizable = true
-        logView.autoresizingMask = [.width, .height]
+        logView.isHorizontallyResizable = false
+        logView.autoresizingMask = [.width]
         logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         logView.backgroundColor = NSColor(calibratedWhite: 0.10, alpha: 1.0)
         logView.textColor = NSColor.white
@@ -250,14 +258,14 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
         logView.string = ""
         let logScroll = NSScrollView()
         logScroll.hasVerticalScroller = true
-        logScroll.hasHorizontalScroller = true
+        logScroll.hasHorizontalScroller = false
         logScroll.autohidesScrollers = true
         logScroll.borderType = .bezelBorder
         logView.frame = logScroll.contentView.bounds
         logView.minSize = NSSize(width: 0, height: logScroll.contentSize.height)
         logView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        logView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        logView.textContainer?.widthTracksTextView = false
+        logView.textContainer?.containerSize = NSSize(width: logScroll.contentSize.width, height: CGFloat.greatestFiniteMagnitude)
+        logView.textContainer?.widthTracksTextView = true
         logScroll.documentView = logView
 
         startButton.target = self
@@ -408,6 +416,12 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
         commandWarning.textColor = .secondaryLabelColor
         commandWarning.maximumNumberOfLines = 0
         commandWarning.preferredMaxLayoutWidth = Layout.contentWidth
+        enableCodexMCPCheckbox.toolTip = "Expose allowlisted MCP servers from the effective Codex configuration through FileMCP."
+        let codexWarning = NSTextField(wrappingLabelWithString: "Downstream MCP tools run with your macOS user permissions and are not limited to the shared directory.")
+        codexWarning.font = .systemFont(ofSize: 10)
+        codexWarning.textColor = .secondaryLabelColor
+        codexWarning.maximumNumberOfLines = 0
+        codexWarning.preferredMaxLayoutWidth = Layout.contentWidth
 
         let profileRow = fieldRow("Profile", profileField)
         let portRow = fieldRow("MCP port", portField)
@@ -415,12 +429,14 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
         let healthRow = fieldRow("Health listener", healthAddressField)
         let gitNameRow = fieldRow("Git name", gitUserNameField)
         let gitEmailRow = fieldRow("Git email", gitUserEmailField)
+        let codexExecutableRow = fieldRow("Codex executable", codexExecutableField)
+        let codexAllowlistRow = fieldRow("MCP allowlist", codexMCPAllowlistField)
 
         advancedSettingsGroup.orientation = .vertical
         advancedSettingsGroup.alignment = .leading
         advancedSettingsGroup.spacing = 8
         advancedSettingsGroup.detachesHiddenViews = true
-        [profileRow, portRow, healthRow, gitNameRow, gitEmailRow].forEach {
+        [profileRow, portRow, healthRow, gitNameRow, gitEmailRow, codexExecutableRow, codexAllowlistRow].forEach {
             advancedSettingsGroup.addArrangedSubview($0)
         }
         advancedSettingsGroup.isHidden = true
@@ -430,6 +446,8 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
             directoryRow,
             enableCommandsCheckbox,
             commandWarning,
+            enableCodexMCPCheckbox,
+            codexWarning,
             advancedToggleButton,
             advancedSettingsGroup,
         ])
@@ -537,6 +555,8 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
             healthAddressField.widthAnchor.constraint(equalToConstant: Layout.fieldWidth),
             gitUserNameField.widthAnchor.constraint(equalToConstant: Layout.fieldWidth),
             gitUserEmailField.widthAnchor.constraint(equalToConstant: Layout.fieldWidth),
+            codexExecutableField.widthAnchor.constraint(equalToConstant: Layout.fieldWidth),
+            codexMCPAllowlistField.widthAnchor.constraint(equalToConstant: Layout.fieldWidth),
         ])
     }
 
@@ -561,6 +581,9 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
         gitUserNameField.stringValue = defaults.string(forKey: ConfigKey.gitUserName) ?? ""
         gitUserEmailField.stringValue = defaults.string(forKey: ConfigKey.gitUserEmail) ?? ""
         enableCommandsCheckbox.state = defaults.bool(forKey: ConfigKey.enableCommands) ? .on : .off
+        enableCodexMCPCheckbox.state = defaults.bool(forKey: ConfigKey.enableCodexMCP) ? .on : .off
+        codexExecutableField.stringValue = defaults.string(forKey: ConfigKey.codexExecutable) ?? "/opt/homebrew/bin/codex"
+        codexMCPAllowlistField.stringValue = defaults.string(forKey: ConfigKey.codexMCPAllowlist) ?? ""
     }
 
     private func updateAPIKeyPlaceholder() {
@@ -587,6 +610,9 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
         defaults.set(gitUserNameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: ConfigKey.gitUserName)
         defaults.set(gitUserEmailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: ConfigKey.gitUserEmail)
         defaults.set(enableCommandsCheckbox.state == .on, forKey: ConfigKey.enableCommands)
+        defaults.set(enableCodexMCPCheckbox.state == .on, forKey: ConfigKey.enableCodexMCP)
+        defaults.set(codexExecutableField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: ConfigKey.codexExecutable)
+        defaults.set(codexMCPAllowlistField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), forKey: ConfigKey.codexMCPAllowlist)
     }
 
     private func saveAllConfiguration() {
@@ -637,7 +663,10 @@ private final class MainViewController: NSViewController, NSTabViewDelegate {
                 healthAddress: healthAddressField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
                 gitUserName: gitUserNameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
                 gitUserEmail: gitUserEmailField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-                enableCommands: enableCommandsCheckbox.state == .on
+                enableCommands: enableCommandsCheckbox.state == .on,
+                enableCodexMCP: enableCodexMCPCheckbox.state == .on,
+                codexExecutable: codexExecutableField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+                codexMCPAllowlist: codexMCPAllowlistField.stringValue.split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
             ))
         } catch { showError(error.localizedDescription) }
     }

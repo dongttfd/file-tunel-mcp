@@ -362,6 +362,7 @@ SWIFT
 
 swiftc -framework Network -framework Security -o "$TMP_DIR/runtime-test" \
     macos/ProcessRunner.swift \
+    macos/CodexMCPGateway.swift \
     macos/LocalMCPServer.swift \
     macos/LocalMCPRuntime.swift \
     "$TMP_DIR/main.swift"
@@ -488,6 +489,7 @@ SWIFT
 
 swiftc -framework Network -o "$TMP_DIR/server-test" \
     macos/ProcessRunner.swift \
+    macos/CodexMCPGateway.swift \
     macos/LocalMCPServer.swift \
     "$TMP_DIR/main.swift"
 mkdir -p "$TMP_DIR/git-template"

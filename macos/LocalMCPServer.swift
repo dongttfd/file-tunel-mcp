@@ -1517,6 +1517,7 @@ final class LocalMCPServer {
     private let localAuthToken: String
     private let tools: LocalTools
     private let skills: CodexSkillRegistry
+    private let codexGateway: CodexMCPGateway
     private let log: (String) -> Void
     private let listenerQueue = DispatchQueue(label: "com.filemcp.http-listener", qos: .userInitiated)
     private let workQueue = DispatchQueue(label: "com.filemcp.http-workers", qos: .userInitiated, attributes: .concurrent)
@@ -1531,6 +1532,9 @@ final class LocalMCPServer {
         gitUserEmail: String,
         enableCommands: Bool,
         localAuthToken: String,
+        enableCodexMCP: Bool = false,
+        codexExecutable: String = "",
+        codexMCPAllowlist: [String] = [],
         log: @escaping (String) -> Void
     ) throws {
         guard localAuthToken.utf8.count >= 32 else {
@@ -1547,6 +1551,12 @@ final class LocalMCPServer {
             enableCommands: enableCommands
         )
         self.skills = try CodexSkillRegistry(rootPath: allowedDirectory, log: log)
+        self.codexGateway = CodexMCPGateway(
+            enabled: enableCodexMCP,
+            executable: codexExecutable,
+            allowlist: codexMCPAllowlist,
+            log: log
+        )
     }
 
     var isReady: Bool {
@@ -1596,9 +1606,11 @@ final class LocalMCPServer {
         }
         log("[MCP] Server listening on http://127.0.0.1:\(port)/mcp\n")
         skills.refresh()
+        codexGateway.refresh()
     }
 
     func stop() {
+        codexGateway.stop()
         listener?.cancel()
         listener = nil
         stateLock.lock()
@@ -1858,7 +1870,7 @@ final class LocalMCPServer {
     }
 
     private func allToolDefinitions() -> [[String: Any]] {
-        tools.toolDefinitions + skills.toolDefinitions
+        tools.toolDefinitions + skills.toolDefinitions + codexGateway.toolDefinitions
     }
 
     private func processLegacyRequest(id: Any, method: String, params: [String: Any]) -> Data {
@@ -1890,7 +1902,7 @@ final class LocalMCPServer {
             var result = modernCompleteResult([
                 "supportedVersions": [mcpModernProtocolVersion],
                 "capabilities": serverCapabilities(),
-                "instructions": "Read and manage files, Git repositories, Codex project skills, and optionally local commands inside the configured shared directory. When a user message begins with '/<skill-name>', call load_codex_skill with that exact name before answering and follow the returned SKILL.md instructions.",
+                "instructions": "Read and manage files, Git repositories, Codex project skills, allowlisted Codex MCP servers, and optionally local commands. Use list_codex_mcp_servers and list_codex_mcp_tools before call_codex_mcp_tool when downstream MCP discovery is needed. When a user message begins with '/<skill-name>', call load_codex_skill with that exact name before answering and follow the returned SKILL.md instructions.",
             ])
             addCacheMetadata(to: &result, ttlMs: 60_000)
             return jsonRPCResult(id: id, result: result)
@@ -1921,7 +1933,7 @@ final class LocalMCPServer {
                 status: modern ? 400 : 200
             )
         }
-        guard tools.hasTool(named: toolName) || skills.hasTool(named: toolName) else {
+        guard tools.hasTool(named: toolName) || skills.hasTool(named: toolName) || codexGateway.hasTool(toolName) else {
             return jsonRPCError(id: id, code: -32602, message: "Unknown tool: \(toolName)")
         }
         let arguments: [String: Any]
@@ -1941,7 +1953,11 @@ final class LocalMCPServer {
         do {
             let content: [[String: Any]]
             let structuredContent: [String: Any]
-            if skills.hasTool(named: toolName) {
+            if codexGateway.hasTool(toolName) {
+                let output = try codexGateway.call(toolName, arguments: arguments)
+                content = output.content
+                structuredContent = output.structuredContent
+            } else if skills.hasTool(named: toolName) {
                 let output = try skills.call(name: toolName, arguments: arguments)
                 content = output.content
                 structuredContent = output.structuredContent

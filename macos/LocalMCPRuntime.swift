@@ -12,6 +12,9 @@ struct LocalMCPConfiguration {
     let gitUserName: String
     let gitUserEmail: String
     let enableCommands: Bool
+    var enableCodexMCP: Bool = false
+    var codexExecutable: String = ""
+    var codexMCPAllowlist: [String] = []
 }
 
 enum LocalMCPRuntimeState: Equatable {
@@ -183,6 +186,9 @@ final class LocalMCPRuntime {
                 gitUserEmail: configuration.gitUserEmail,
                 enableCommands: configuration.enableCommands,
                 localAuthToken: localAuthToken,
+                enableCodexMCP: configuration.enableCodexMCP,
+                codexExecutable: configuration.codexExecutable,
+                codexMCPAllowlist: configuration.codexMCPAllowlist,
                 log: { [weak self] text in self?.emitLog(text) }
             )
             try server.start()

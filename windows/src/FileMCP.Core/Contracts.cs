@@ -41,7 +41,10 @@ public sealed record LocalMcpConfiguration(
     string HealthAddress,
     string GitUserName,
     string GitUserEmail,
-    bool EnableCommands);
+    bool EnableCommands,
+    bool EnableCodexMcp = false,
+    string CodexExecutable = "",
+    string[]? CodexMcpAllowlist = null);
 
 public enum LocalMcpRuntimeStatus
 {
@@ -76,4 +79,7 @@ public sealed class FileMcpSettings
     public string GitUserName { get; set; } = "";
     public string GitUserEmail { get; set; } = "";
     public bool EnableCommands { get; set; }
+    public bool EnableCodexMcp { get; set; }
+    public string CodexExecutable { get; set; } = "codex.exe";
+    public string[] CodexMcpAllowlist { get; set; } = [];
 }

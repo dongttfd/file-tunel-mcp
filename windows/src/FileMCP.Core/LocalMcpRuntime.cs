@@ -72,7 +72,7 @@ public sealed class LocalMcpRuntime : IAsyncDisposable
                 var healthAddress = ValidateConfiguration(configuration);
                 _profileLock = new ProfileLock(configuration.Profile); _profileLock.Acquire();
                 var localAuthToken = MakeLocalAuthToken();
-                _server = new LocalMcpServer(configuration.Port, configuration.AllowedDirectory, configuration.GitUserName, configuration.GitUserEmail, configuration.EnableCommands, localAuthToken, EmitLog);
+                _server = new LocalMcpServer(configuration.Port, configuration.AllowedDirectory, configuration.GitUserName, configuration.GitUserEmail, configuration.EnableCommands, localAuthToken, EmitLog, configuration.EnableCodexMcp, configuration.CodexExecutable, configuration.CodexMcpAllowlist);
                 await _server.StartAsync(cancellationToken).ConfigureAwait(false);
 
                 var tunnelClient = TunnelClientPath(); var profileDirectory = TunnelProfileDirectory();

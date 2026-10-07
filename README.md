@@ -139,6 +139,9 @@ The common workflow and terminology are kept aligned across macOS and Windows. T
 | Runtime API key | Authenticates `tunnel-client`; stored in the platform credential store. |
 | Shared directory | The only filesystem root exposed to MCP file tools. |
 | Allow shell commands | Enables `run_command`; disabled by default. |
+| Enable Codex MCP federation | Exposes gateway tools for explicitly allowlisted MCP servers from the effective Codex configuration; disabled by default. |
+| Codex executable | Path to the Codex CLI used to read the effective MCP configuration. |
+| MCP allowlist | Comma-separated Codex MCP server names that FileMCP may start and call. |
 | Profile | FileMCP-owned `tunnel-client` profile name; letters/numbers plus `.`, `_`, `-`, maximum 128 characters. |
 | MCP port | Local loopback port used by the MCP server. |
 | Health listener | Loopback-only `tunnel-client` health/admin listener. Port `0` requests an ephemeral port. |
@@ -190,6 +193,15 @@ run_command(command, cwd="", timeout_seconds=30)
 - Windows executes through Windows PowerShell with `-NoProfile -NonInteractive`.
 
 Only the working directory is constrained to the shared root. Once command execution is enabled, the command itself has the normal permissions of the signed-in user.
+
+### Codex MCP federation
+
+When federation is enabled, FileMCP exposes `list_codex_mcp_servers`,
+`list_codex_mcp_tools`, and `call_codex_mcp_tool`. Only enabled Codex MCP
+servers named in FileMCP's allowlist are available. Downstream stdio servers
+run locally with the signed-in user's permissions and are not constrained to
+the shared directory. FileMCP clears discovered configuration, tool state, and
+downstream sessions on disconnect.
 
 ## Security model
 
